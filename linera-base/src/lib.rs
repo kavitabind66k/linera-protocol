@@ -6,13 +6,16 @@
 //! applications (compiled from Rust to Wasm).
 
 #![deny(missing_docs)]
-#![deny(clippy::large_futures)]
+#![allow(async_fn_in_trait)]
 
 use std::fmt;
 
 #[doc(hidden)]
 pub use async_trait::async_trait;
-
+#[cfg(all(not(target_arch = "wasm32"), unix))]
+use tokio::signal::unix;
+#[cfg(not(target_arch = "wasm32"))]
+use {::tracing::debug, tokio_util::sync::CancellationToken};
 pub mod abi;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod command;
@@ -21,6 +24,7 @@ pub mod data_types;
 pub mod dyn_convert;
 mod graphql;
 pub mod hashed;
+pub mod http;
 pub mod identifiers;
 mod limited_writer;
 pub mod ownership;
@@ -30,13 +34,12 @@ pub mod port;
 pub mod prometheus_util;
 #[cfg(not(chain))]
 pub mod task;
-#[cfg(not(chain))]
-pub use task::Blocking;
+pub mod task_processor;
 pub mod time;
-#[cfg_attr(web, path = "tracing_web.rs")]
-pub mod tracing;
 #[cfg(test)]
 mod unit_tests;
+pub mod util;
+pub mod vm;
 
 pub use graphql::BcsHexParseError;
 #[doc(hidden)]
@@ -137,7 +140,7 @@ pub fn hex_debug<T: AsRef<[u8]>>(bytes: &T, f: &mut fmt::Formatter) -> fmt::Resu
 ///     "Messages { byte_vecs: [12345678, 9a] }"
 /// );
 /// ```
-#[allow(clippy::ptr_arg)] // This only works with custom_debug_derive if it's &Vec.
+#[expect(clippy::ptr_arg)] // This only works with custom_debug_derive if it's &Vec.
 pub fn hex_vec_debug(list: &Vec<Vec<u8>>, f: &mut fmt::Formatter) -> fmt::Result {
     write!(f, "[")?;
     for (i, bytes) in list.iter().enumerate() {
@@ -147,4 +150,40 @@ pub fn hex_vec_debug(list: &Vec<Vec<u8>>, f: &mut fmt::Formatter) -> fmt::Result
         hex_debug(bytes, f)?;
     }
     write!(f, "]")
+}
+
+/// Helper function for allocative.
+pub fn visit_allocative_simple<T>(_: &T, visitor: &mut allocative::Visitor<'_>) {
+    visitor.visit_simple_sized::<T>();
+}
+
+/// Listens for shutdown signals, and notifies the [`CancellationToken`] if one is
+/// received.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn listen_for_shutdown_signals(shutdown_sender: CancellationToken) {
+    let _shutdown_guard = shutdown_sender.drop_guard();
+
+    #[cfg(unix)]
+    {
+        let mut sigint =
+            unix::signal(unix::SignalKind::interrupt()).expect("Failed to set up SIGINT handler");
+        let mut sigterm =
+            unix::signal(unix::SignalKind::terminate()).expect("Failed to set up SIGTERM handler");
+        let mut sighup =
+            unix::signal(unix::SignalKind::hangup()).expect("Failed to set up SIGHUP handler");
+
+        tokio::select! {
+            _ = sigint.recv() => debug!("Received SIGINT"),
+            _ = sigterm.recv() => debug!("Received SIGTERM"),
+            _ = sighup.recv() => debug!("Received SIGHUP"),
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to set up Ctrl+C handler");
+        debug!("Received Ctrl+C");
+    }
 }

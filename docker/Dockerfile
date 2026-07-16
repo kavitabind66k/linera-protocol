@@ -9,6 +9,9 @@
 # - `target` is a Rust target quadruple. Currently known to be
 #   supported are `x86_64-unknown-linux-gnu` and
 #   `aarch64-unknown-linux-gnu`.
+# - `build_flag` is either "--release" or an empty string.
+# - `build_folder` is either "release" or "debug".
+# - `build_features` is a comma-separated list of features to build the binaries with.
 
 # Stage 1 - Generate recipe file for dependencies
 
@@ -20,15 +23,24 @@ ARG build_date
 ARG target=x86_64-unknown-linux-gnu
 ARG binaries=
 ARG copy=${binaries:+_copy}
+ARG build_flag=--release
+ARG build_folder=release
+ARG build_features=scylladb,metrics,memory-profiling
+ARG rustflags="-C force-frame-pointers=yes"
 
 FROM rust:1.74-slim-bookworm AS builder
 ARG git_commit
 ARG target
+ARG build_flag
+ARG build_folder
+ARG build_features
+ARG rustflags
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
     protobuf-compiler \
-    clang
+    clang \
+    make
 
 COPY examples examples
 COPY linera-base linera-base
@@ -38,7 +50,9 @@ COPY linera-core linera-core
 COPY linera-ethereum linera-ethereum
 COPY linera-execution linera-execution
 COPY linera-explorer linera-explorer
+COPY linera-faucet linera-faucet
 COPY linera-indexer linera-indexer
+COPY linera-metrics linera-metrics
 COPY linera-rpc linera-rpc
 COPY linera-sdk linera-sdk
 COPY linera-sdk-derive linera-sdk-derive
@@ -47,30 +61,28 @@ COPY linera-service-graphql-client linera-service-graphql-client
 COPY linera-storage linera-storage
 COPY linera-storage-service linera-storage-service
 COPY linera-summary linera-summary
+COPY linera-persistent linera-persistent
 COPY linera-version linera-version
 COPY linera-views linera-views
 COPY linera-views-derive linera-views-derive
 COPY linera-witty linera-witty
 COPY linera-witty-macros linera-witty-macros
 COPY scripts scripts
+COPY web web
 COPY rust-toolchain* Cargo.* ./
 
 ENV GIT_COMMIT=${git_commit}
+ENV RUSTFLAGS=${rustflags}
 
-RUN cargo build --release \
-    --target "$target" \
-    --bin linera \
-    --bin linera-proxy \
-    --bin linera-server \
-    --features scylladb,metrics
+RUN cargo build ${build_flag:+"$build_flag"} --target "$target" --bin linera-proxy --features $build_features
+RUN cargo build ${build_flag:+"$build_flag"} --target "$target" --bin linera-server --features $build_features
+RUN cargo build ${build_flag:+"$build_flag"} --target "$target" --bin linera --features $build_features
 
 RUN mv \
-    target/"$target"/release/linera \
-    target/"$target"/release/linera-proxy \
-    target/"$target"/release/linera-server \
+    target/"$target"/"$build_folder"/linera \
+    target/"$target"/"$build_folder"/linera-proxy \
+    target/"$target"/"$build_folder"/linera-server \
     ./
-
-RUN strip linera linera-proxy linera-server
 
 # Optionally copy binaries instead of using the build images above
 FROM scratch AS builder_copy
@@ -103,13 +115,4 @@ COPY --from=binaries \
     linera \
     linera-server \
     linera-proxy \
-    ./
-
-COPY --chmod=755 \
-    docker/server-entrypoint.sh \
-    docker/server-init.sh \
-    docker/proxy-init.sh \
-    docker/compose-server-entrypoint.sh \
-    docker/compose-proxy-entrypoint.sh \
-    docker/compose-server-init.sh \
     ./

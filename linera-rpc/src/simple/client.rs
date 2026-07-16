@@ -4,11 +4,10 @@
 
 use std::future::Future;
 
-use async_trait::async_trait;
 use futures::{sink::SinkExt, stream::StreamExt};
 use linera_base::{
     crypto::CryptoHash,
-    data_types::BlobContent,
+    data_types::{BlobContent, BlockHeight, NetworkDescription},
     identifiers::{BlobId, ChainId},
     time::{timer, Duration},
 };
@@ -26,7 +25,7 @@ use linera_version::VersionInfo;
 
 use super::{codec, transport::TransportProtocol};
 use crate::{
-    config::ValidatorPublicNetworkPreConfig, mass_client, HandleConfirmedCertificateRequest,
+    config::ValidatorPublicNetworkPreConfig, HandleConfirmedCertificateRequest,
     HandleLiteCertRequest, HandleTimeoutCertificateRequest, HandleValidatedCertificateRequest,
     RpcMessage,
 };
@@ -78,6 +77,13 @@ impl SimpleClient {
 impl ValidatorNode for SimpleClient {
     type NotificationStream = NotificationStream;
 
+    fn address(&self) -> String {
+        format!(
+            "{}://{}:{}",
+            self.network.protocol, self.network.host, self.network.port
+        )
+    }
+
     /// Initiates a new block.
     async fn handle_block_proposal(
         &self,
@@ -87,7 +93,7 @@ impl ValidatorNode for SimpleClient {
         self.query(request).await
     }
 
-    /// Processes a hash certificate.
+    /// Processes a lite certificate.
     async fn handle_lite_certificate(
         &self,
         certificate: LiteCertificate<'_>,
@@ -157,8 +163,8 @@ impl ValidatorNode for SimpleClient {
         self.query(RpcMessage::VersionInfoQuery).await
     }
 
-    async fn get_genesis_config_hash(&self) -> Result<CryptoHash, NodeError> {
-        self.query(RpcMessage::GenesisConfigHashQuery).await
+    async fn get_network_description(&self) -> Result<NetworkDescription, NodeError> {
+        self.query(RpcMessage::NetworkDescriptionQuery).await
     }
 
     async fn upload_blob(&self, content: BlobContent) -> Result<BlobId, NodeError> {
@@ -223,92 +229,53 @@ impl ValidatorNode for SimpleClient {
         }
     }
 
+    async fn download_certificates_by_heights(
+        &self,
+        chain_id: ChainId,
+        heights: Vec<BlockHeight>,
+    ) -> Result<Vec<ConfirmedBlockCertificate>, NodeError> {
+        let expected_count = heights.len();
+        let certificates: Vec<ConfirmedBlockCertificate> = self
+            .query(RpcMessage::DownloadCertificatesByHeights(
+                chain_id,
+                heights.clone(),
+            ))
+            .await?;
+
+        if certificates.len() < expected_count {
+            return Err(NodeError::MissingCertificatesByHeights { chain_id, heights });
+        }
+        Ok(certificates)
+    }
+
     async fn blob_last_used_by(&self, blob_id: BlobId) -> Result<CryptoHash, NodeError> {
         self.query(RpcMessage::BlobLastUsedBy(Box::new(blob_id)))
             .await
     }
 
+    async fn blob_last_used_by_certificate(
+        &self,
+        blob_id: BlobId,
+    ) -> Result<ConfirmedBlockCertificate, NodeError> {
+        self.query::<ConfirmedBlockCertificate>(RpcMessage::BlobLastUsedByCertificate(Box::new(
+            blob_id,
+        )))
+        .await
+    }
+
     async fn missing_blob_ids(&self, blob_ids: Vec<BlobId>) -> Result<Vec<BlobId>, NodeError> {
         self.query(RpcMessage::MissingBlobIds(blob_ids)).await
     }
-}
 
-#[derive(Clone)]
-pub struct SimpleMassClient {
-    pub network: ValidatorPublicNetworkPreConfig<TransportProtocol>,
-    send_timeout: Duration,
-    recv_timeout: Duration,
-}
-
-impl SimpleMassClient {
-    pub fn new(
-        network: ValidatorPublicNetworkPreConfig<TransportProtocol>,
-        send_timeout: Duration,
-        recv_timeout: Duration,
-    ) -> Self {
-        Self {
-            network,
-            send_timeout,
-            recv_timeout,
-        }
-    }
-}
-
-#[async_trait]
-impl mass_client::MassClient for SimpleMassClient {
-    async fn send(
+    async fn get_shard_info(
         &self,
-        requests: Vec<RpcMessage>,
-        max_in_flight: usize,
-    ) -> Result<Vec<RpcMessage>, mass_client::MassClientError> {
-        let address = format!("{}:{}", self.network.host, self.network.port);
-        let mut stream = self.network.protocol.connect(address).await?;
-        let mut requests = requests.into_iter();
-        let mut in_flight = 0;
-        let mut responses = Vec::new();
-
-        loop {
-            while in_flight < max_in_flight {
-                let request = match requests.next() {
-                    None => {
-                        if in_flight == 0 {
-                            return Ok(responses);
-                        }
-                        // No more entries to send.
-                        break;
-                    }
-                    Some(request) => request,
-                };
-                let status = timer::timeout(self.send_timeout, stream.send(request)).await;
-                if let Err(error) = status {
-                    tracing::error!("Failed to send request: {}", error);
-                    continue;
-                }
-                in_flight += 1;
-            }
-            if requests.len() % 5000 == 0 && requests.len() > 0 {
-                tracing::info!("In flight {} Remaining {}", in_flight, requests.len());
-            }
-            match timer::timeout(self.recv_timeout, stream.next()).await {
-                Ok(Some(Ok(message))) => {
-                    in_flight -= 1;
-                    responses.push(message);
-                }
-                Ok(Some(Err(error))) => {
-                    tracing::error!("Received error response: {}", error);
-                }
-                Ok(None) => {
-                    tracing::info!("Socket closed by server");
-                    return Ok(responses);
-                }
-                Err(error) => {
-                    tracing::error!(
-                        "Timeout while receiving response: {} (in flight: {})",
-                        error,
-                        in_flight
-                    );
-                }
-            }
-        }
+        chain_id: ChainId,
+    ) -> Result<linera_core::data_types::ShardInfo, NodeError> {
+        let rpc_shard_info: crate::message::ShardInfo =
+            self.query(RpcMessage::ShardInfoQuery(chain_id)).await?;
+        Ok(linera_core::data_types::ShardInfo {
+            shard_id: rpc_shard_info.shard_id,
+            total_shards: rpc_shard_info.total_shards,
+        })
     }
 }

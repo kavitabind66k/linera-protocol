@@ -1,106 +1,85 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::large_futures)]
+use std::{sync::Arc, time::Duration};
 
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
-
-use async_trait::async_trait;
 use futures::{lock::Mutex, FutureExt as _};
 use linera_base::{
-    crypto::{KeyPair, PublicKey},
-    data_types::{Amount, BlockHeight, TimeDelta, Timestamp},
-    identifiers::ChainId,
+    crypto::{AccountPublicKey, InMemorySigner},
+    data_types::{Amount, BlockHeight, Epoch, TimeDelta, Timestamp},
+    identifiers::{Account, AccountOwner, ChainId},
     ownership::{ChainOwnership, TimeoutConfig},
 };
 use linera_core::{
-    client::{ChainClient, Client},
-    node::CrossChainMessageDelivery,
-    test_utils::{MemoryStorageBuilder, NodeProvider, StorageBuilder as _, TestBuilder},
-    DEFAULT_GRACE_PERIOD,
+    client::{chain_client, ChainClient, Client},
+    environment,
+    test_utils::{MemoryStorageBuilder, StorageBuilder as _, TestBuilder},
+    wallet,
 };
-use linera_execution::system::Recipient;
-use linera_storage::{DbStorage, TestClock};
-use linera_views::memory::MemoryStore;
-use rand::SeedableRng as _;
+use linera_storage::Storage;
+use tokio_util::sync::CancellationToken;
 
-use super::util::make_genesis_config;
 use crate::{
     chain_listener::{self, ChainListener, ChainListenerConfig, ClientContext as _},
-    wallet::{UserChain, Wallet},
+    config::GenesisConfig,
     Error,
 };
 
-type TestStorage = DbStorage<MemoryStore, TestClock>;
-type TestProvider = NodeProvider<TestStorage>;
-
 struct ClientContext {
-    wallet: Wallet,
-    client: Arc<Client<TestProvider, TestStorage>>,
+    client: Arc<Client<environment::Test>>,
 }
 
-#[cfg_attr(not(web), async_trait)]
-#[cfg_attr(web, async_trait(?Send))]
 impl chain_listener::ClientContext for ClientContext {
-    type ValidatorNodeProvider = TestProvider;
-    type Storage = TestStorage;
+    type Environment = environment::Test;
 
-    fn wallet(&self) -> &Wallet {
-        &self.wallet
+    fn wallet(&self) -> &environment::TestWallet {
+        self.client.wallet()
     }
 
-    fn make_chain_client(
+    fn storage(&self) -> &environment::TestStorage {
+        self.client.storage_client()
+    }
+
+    fn client(&self) -> &Arc<linera_core::client::Client<Self::Environment>> {
+        &self.client
+    }
+
+    fn timing_sender(
         &self,
-        chain_id: ChainId,
-    ) -> Result<ChainClient<TestProvider, TestStorage>, Error> {
-        let chain = self
-            .wallet
-            .get(chain_id)
-            .unwrap_or_else(|| panic!("Unknown chain: {}", chain_id));
-        let known_key_pairs = chain
-            .key_pair
-            .as_ref()
-            .map(|kp| kp.copy())
-            .into_iter()
-            .collect();
-        Ok(self.client.create_chain_client(
-            chain_id,
-            known_key_pairs,
-            self.wallet.genesis_admin_chain(),
-            chain.block_hash,
-            chain.timestamp,
-            chain.next_block_height,
-            chain.pending_block.clone(),
-            chain.pending_blobs.clone(),
-        ))
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<(u64, linera_core::client::TimingType)>> {
+        None
     }
 
     async fn update_wallet_for_new_chain(
         &mut self,
         chain_id: ChainId,
-        key_pair: Option<KeyPair>,
+        owner: Option<AccountOwner>,
         timestamp: Timestamp,
+        epoch: Epoch,
     ) -> Result<(), Error> {
-        if self.wallet.get(chain_id).is_none() {
-            self.wallet.insert(UserChain {
-                chain_id,
-                key_pair: key_pair.as_ref().map(|kp| kp.copy()),
-                block_hash: None,
-                timestamp,
-                next_block_height: BlockHeight::ZERO,
-                pending_block: None,
-                pending_blobs: BTreeMap::new(),
-            });
-        }
-
+        let _ = self
+            .wallet()
+            .try_insert(chain_id, wallet::Chain::new(owner, epoch, timestamp));
         Ok(())
     }
 
     async fn update_wallet(
         &mut self,
-        client: &ChainClient<TestProvider, TestStorage>,
+        client: &ChainClient<environment::Test>,
     ) -> Result<(), Error> {
-        self.wallet.update_from_state(client).await;
+        let info = client.chain_info().await?;
+        let client_owner = client.preferred_owner();
+        let pending_proposal = client.pending_proposal().clone();
+        let follow_only = client.is_follow_only();
+        self.wallet().insert(
+            info.chain_id,
+            wallet::Chain {
+                pending_proposal,
+                owner: client_owner,
+                follow_only,
+                ..info.as_ref().into()
+            },
+        );
         Ok(())
     }
 }
@@ -110,45 +89,58 @@ impl chain_listener::ClientContext for ClientContext {
 #[test_log::test(tokio::test)]
 async fn test_chain_listener() -> anyhow::Result<()> {
     // Create two chains.
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let mut signer = InMemorySigner::new(Some(42));
+    let key_pair = signer.generate_new();
+    let owner: AccountOwner = key_pair.into();
     let config = ChainListenerConfig::default();
     let storage_builder = MemoryStorageBuilder::default();
     let clock = storage_builder.clock().clone();
-    let mut builder = TestBuilder::new(storage_builder, 4, 1).await?;
+    let mut builder = TestBuilder::new(storage_builder, 4, 1, signer.clone()).await?;
     let client0 = builder.add_root_chain(0, Amount::ONE).await?;
     let chain_id0 = client0.chain_id();
     let client1 = builder.add_root_chain(1, Amount::ONE).await?;
-
     // Start a chain listener for chain 0 with a new key.
-    let genesis_config = make_genesis_config(&builder);
+    let genesis_config = GenesisConfig::new_testing(&builder);
+    let admin_id = genesis_config.admin_id();
     let storage = builder.make_storage().await?;
-    let delivery = CrossChainMessageDelivery::NonBlocking;
+    let epoch0 = client0.chain_info().await?.epoch;
+    let epoch1 = client1.chain_info().await?.epoch;
+
     let mut context = ClientContext {
-        wallet: Wallet::new(genesis_config, Some(37)),
         client: Arc::new(Client::new(
-            builder.make_node_provider(),
-            storage.clone(),
-            10,
-            delivery,
+            environment::Impl {
+                storage: storage.clone(),
+                network: builder.make_node_provider(),
+                signer,
+                wallet: environment::TestWallet::default(),
+            },
+            admin_id,
             false,
             [chain_id0],
             format!("Client node for {:.8}", chain_id0),
-            NonZeroUsize::new(20).expect("Chain worker LRU cache size must be non-zero"),
-            DEFAULT_GRACE_PERIOD,
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            chain_client::Options::test_default(),
+            5_000,
+            10_000,
+            linera_core::client::RequestsSchedulerConfig::default(),
         )),
     };
-    let key_pair = KeyPair::generate_from(&mut rng);
-    let public_key = key_pair.public();
     context
-        .update_wallet_for_new_chain(chain_id0, Some(key_pair), clock.current_time())
+        .update_wallet_for_new_chain(chain_id0, Some(owner), clock.current_time(), epoch0)
         .await?;
-    let context = Arc::new(Mutex::new(context));
-    let listener = ChainListener::new(config);
-    listener.run(context, storage).await;
+    context
+        .update_wallet_for_new_chain(
+            client1.chain_id(),
+            client1.preferred_owner(),
+            clock.current_time(),
+            epoch1,
+        )
+        .await?;
 
     // Transfer ownership of chain 0 to the chain listener and some other key. The listener will
     // be leader in ~10% of the rounds.
-    let owners = [(public_key, 1), (PublicKey::test_key(1), 9)];
+    let owners = [(owner, 1), (AccountPublicKey::test_key(1).into(), 9)];
     let timeout_config = TimeoutConfig {
         base_timeout: TimeDelta::from_secs(1),
         timeout_increment: TimeDelta::ZERO,
@@ -158,10 +150,27 @@ async fn test_chain_listener() -> anyhow::Result<()> {
         .change_ownership(ChainOwnership::multiple(owners, 0, timeout_config))
         .await?;
 
+    let context = Arc::new(Mutex::new(context));
+    let cancellation_token = CancellationToken::new();
+    let child_token = cancellation_token.child_token();
+    let chain_listener = ChainListener::new(
+        config,
+        context,
+        storage,
+        child_token,
+        tokio::sync::mpsc::unbounded_channel().1,
+    )
+    .run(false) // Unit test doesn't need background sync
+    .await
+    .unwrap();
+
+    let handle = linera_base::task::spawn(async move { chain_listener.await.unwrap() });
     // Transfer one token to chain 0. The listener should eventually become leader and receive
     // the message.
-    let recipient0 = Recipient::chain(chain_id0);
-    client1.transfer(None, Amount::ONE, recipient0).await?;
+    let recipient0 = Account::chain(chain_id0);
+    client1
+        .transfer(AccountOwner::CHAIN, Amount::ONE, recipient0)
+        .await?;
     for i in 0.. {
         client0.synchronize_from_validators().boxed().await?;
         let balance = client0.local_balance().await?;
@@ -173,6 +182,246 @@ async fn test_chain_listener() -> anyhow::Result<()> {
             panic!("Unexpected local balance: {}", balance);
         }
     }
+
+    cancellation_token.cancel();
+    handle.await;
+
+    Ok(())
+}
+
+/// Tests that a follow-only chain listener does NOT process its inbox when receiving messages.
+/// We set up a listener with two chains: chain A (follow-only but owned) and chain B (FullChain).
+/// The sender sends a message to A first, then to B. Once the listener processes B's inbox
+/// (which we can observe), we know it must have also seen A's notification - but A's inbox
+/// should remain unprocessed because it's follow-only (not because of missing ownership).
+#[test_log::test(tokio::test)]
+async fn test_chain_listener_follow_only() -> anyhow::Result<()> {
+    let signer = InMemorySigner::new(Some(42));
+    let config = ChainListenerConfig::default();
+    let storage_builder = MemoryStorageBuilder::default();
+    let clock = storage_builder.clock().clone();
+    let mut builder = TestBuilder::new(storage_builder, 4, 1, signer.clone()).await?;
+
+    // Create three chains: sender, chain_a (will be follow-only), chain_b (will be FullChain).
+    let sender = builder.add_root_chain(0, Amount::from_tokens(10)).await?;
+    let chain_a = builder.add_root_chain(1, Amount::ZERO).await?;
+    let chain_b = builder.add_root_chain(2, Amount::ZERO).await?;
+    let chain_a_id = chain_a.chain_id();
+    let chain_b_id = chain_b.chain_id();
+
+    let genesis_config = GenesisConfig::new_testing(&builder);
+    let admin_id = genesis_config.admin_id();
+    let storage = builder.make_storage().await?;
+    let chain_a_info = chain_a.chain_info().await?;
+    let chain_b_info = chain_b.chain_info().await?;
+
+    let context = ClientContext {
+        client: Arc::new(Client::new(
+            environment::Impl {
+                storage: storage.clone(),
+                network: builder.make_node_provider(),
+                signer,
+                wallet: environment::TestWallet::default(),
+            },
+            admin_id,
+            false,
+            [chain_a_id, chain_b_id],
+            "Client node with follow-only and owned chains".to_string(),
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            chain_client::Options::test_default(),
+            5_000,
+            10_000,
+            linera_core::client::RequestsSchedulerConfig::default(),
+        )),
+    };
+
+    // Add chain A as follow-only. We *do* own it, but follow_only should prevent inbox processing.
+    context.wallet().insert(
+        chain_a_id,
+        wallet::Chain {
+            owner: chain_a.preferred_owner(),
+            block_hash: chain_a_info.block_hash,
+            next_block_height: chain_a_info.next_block_height,
+            timestamp: clock.current_time(),
+            pending_proposal: None,
+            epoch: Some(chain_a_info.epoch),
+            follow_only: true,
+        },
+    );
+
+    // Add chain B as FullChain mode.
+    context.wallet().insert(
+        chain_b_id,
+        wallet::Chain {
+            owner: chain_b.preferred_owner(),
+            block_hash: chain_b_info.block_hash,
+            next_block_height: chain_b_info.next_block_height,
+            timestamp: clock.current_time(),
+            pending_proposal: None,
+            epoch: Some(chain_b_info.epoch),
+            follow_only: false,
+        },
+    );
+
+    let context = Arc::new(Mutex::new(context));
+    let cancellation_token = CancellationToken::new();
+    let child_token = cancellation_token.child_token();
+    let chain_listener = ChainListener::new(
+        config,
+        context.clone(),
+        storage.clone(),
+        child_token,
+        tokio::sync::mpsc::unbounded_channel().1,
+    )
+    .run(false) // Unit test doesn't need background sync
+    .await
+    .unwrap();
+
+    let handle = linera_base::task::spawn(async move { chain_listener.await.unwrap() });
+
+    // Send a message to chain A first (follow-only). This notification should be ignored.
+    sender
+        .transfer(AccountOwner::CHAIN, Amount::ONE, Account::chain(chain_a_id))
+        .await?;
+
+    // Then send a message to chain B (owned). The listener should process this inbox.
+    sender
+        .transfer(AccountOwner::CHAIN, Amount::ONE, Account::chain(chain_b_id))
+        .await?;
+
+    // Wait until chain B processes its inbox. Once this happens, we know the listener
+    // has seen both notifications (A's came first), but should have only acted on B's.
+    for i in 0.. {
+        tokio::task::yield_now().await;
+
+        chain_b.synchronize_from_validators().await?;
+        let chain_b_info = chain_b.chain_info().await?;
+        // Chain B should have height 1 after processing its inbox.
+        if chain_b_info.next_block_height >= BlockHeight::from(1) {
+            break;
+        }
+        if i >= 50 {
+            panic!(
+                "Chain B's inbox was not processed by the listener. Expected height >= 1, got {}",
+                chain_b_info.next_block_height
+            );
+        }
+    }
+
+    // Now verify that chain A's inbox was NOT processed (follow-only ignores NewIncomingBundle).
+    chain_a.synchronize_from_validators().await?;
+    let chain_a_info = chain_a.chain_info().await?;
+    assert_eq!(
+        chain_a_info.next_block_height,
+        BlockHeight::ZERO,
+        "Follow-only chain A should not have had its inbox processed"
+    );
+
+    // Verify that the listener's wallet still shows chain A at height 0.
+    let wallet_chain_a = context.lock().await.wallet().get(chain_a_id).unwrap();
+    assert_eq!(
+        wallet_chain_a.next_block_height,
+        BlockHeight::ZERO,
+        "Wallet should show chain A at height 0"
+    );
+
+    // Now have the original chain_a client process its inbox, creating a block.
+    chain_a.process_inbox().await?;
+
+    // Wait for the chain listener to see the NewBlock notification and update its wallet.
+    // This verifies that follow-only mode DOES process NewBlock notifications.
+    for i in 0.. {
+        tokio::task::yield_now().await;
+
+        let wallet_chain_a = context.lock().await.wallet().get(chain_a_id).unwrap();
+        if wallet_chain_a.next_block_height >= BlockHeight::from(1) {
+            break;
+        }
+        if i >= 50 {
+            panic!(
+                "Wallet not updated after chain A created a block. Expected height >= 1, got {}",
+                wallet_chain_a.next_block_height
+            );
+        }
+    }
+
+    // Verify the wallet was updated and follow_only is preserved.
+    let wallet_chain_a = context.lock().await.wallet().get(chain_a_id).unwrap();
+    assert!(
+        wallet_chain_a.follow_only,
+        "follow_only flag should be preserved in wallet"
+    );
+
+    cancellation_token.cancel();
+    handle.await;
+
+    Ok(())
+}
+
+/// Tests that the chain listener always listens to the admin chain.
+#[test_log::test(tokio::test)]
+async fn test_chain_listener_admin_chain() -> anyhow::Result<()> {
+    let signer = InMemorySigner::new(Some(42));
+    let config = ChainListenerConfig::default();
+    let storage_builder = MemoryStorageBuilder::default();
+    let mut builder = TestBuilder::new(storage_builder, 4, 1, signer.clone()).await?;
+    let client0 = builder.add_root_chain(0, Amount::ONE).await?;
+    let genesis_config = GenesisConfig::new_testing(&builder);
+    let admin_id = genesis_config.admin_id();
+    let storage = builder.make_storage().await?;
+
+    let context = ClientContext {
+        client: Arc::new(Client::new(
+            environment::Impl {
+                storage: storage.clone(),
+                network: builder.make_node_provider(),
+                signer,
+                wallet: environment::TestWallet::default(),
+            },
+            admin_id,
+            false,
+            [],
+            "Client node with no chains".to_string(),
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+            chain_client::Options::test_default(),
+            5_000,
+            10_000,
+            linera_core::client::RequestsSchedulerConfig::default(),
+        )),
+    };
+    let context = Arc::new(Mutex::new(context));
+    let cancellation_token = CancellationToken::new();
+    let child_token = cancellation_token.child_token();
+    let chain_listener = ChainListener::new(
+        config,
+        context,
+        storage.clone(),
+        child_token,
+        tokio::sync::mpsc::unbounded_channel().1,
+    )
+    .run(false) // Unit test doesn't need background sync
+    .await
+    .unwrap();
+
+    let handle = linera_base::task::spawn(async move { chain_listener.await.unwrap() });
+    let committee = builder.initial_committee.clone();
+    // Stage a committee (this will emit events that the listener should be listening to).
+    let certificate = client0.stage_new_committee(committee).await?.unwrap();
+    for i in 0.. {
+        linera_base::time::timer::sleep(Duration::from_secs(i)).await;
+        let result = storage.read_certificate(certificate.hash()).await?;
+        if result.as_ref() == Some(&certificate) {
+            break;
+        }
+        if i == 5 {
+            panic!("Failed to learn about new block.");
+        }
+    }
+
+    cancellation_token.cancel();
+    handle.await;
 
     Ok(())
 }

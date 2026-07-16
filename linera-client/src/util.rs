@@ -7,7 +7,7 @@ use futures::future;
 use linera_base::{
     crypto::CryptoError,
     data_types::{TimeDelta, Timestamp},
-    identifiers::ChainId,
+    identifiers::{ApplicationId, ChainId, GenericApplicationId},
     time::Duration,
 };
 use linera_core::{data_types::RoundTimeout, node::NotificationStream, worker::Reason};
@@ -32,12 +32,24 @@ pub fn parse_chain_set(s: &str) -> Result<HashSet<ChainId>, CryptoError> {
     }
 }
 
+pub fn parse_app_set(s: &str) -> anyhow::Result<HashSet<GenericApplicationId>> {
+    s.trim()
+        .split(",")
+        .map(|app_str| {
+            GenericApplicationId::from_str(app_str)
+                .or_else(|_| Ok(ApplicationId::from_str(app_str)?.into()))
+        })
+        .collect()
+}
+
 /// Returns after the specified time or if we receive a notification that a new round has started.
 pub async fn wait_for_next_round(stream: &mut NotificationStream, timeout: RoundTimeout) {
     let mut stream = stream.filter(|notification| match &notification.reason {
-        Reason::NewBlock { height, .. } => *height >= timeout.next_block_height,
+        Reason::NewBlock { height, .. } | Reason::NewEvents { height, .. } => {
+            *height >= timeout.next_block_height
+        }
         Reason::NewRound { round, .. } => *round > timeout.current_round,
-        Reason::NewIncomingBundle { .. } => false,
+        Reason::NewIncomingBundle { .. } | Reason::BlockExecuted { .. } => false,
     });
     future::select(
         Box::pin(stream.next()),
@@ -46,16 +58,6 @@ pub async fn wait_for_next_round(stream: &mut NotificationStream, timeout: Round
         )),
     )
     .await;
-}
-
-macro_rules! impl_from_dynamic {
-    ($target:ty : $variant:ident, $source:ty) => {
-        impl From<$source> for $target {
-            fn from(error: $source) -> Self {
-                <$target>::$variant(Box::new(error))
-            }
-        }
-    };
 }
 
 macro_rules! impl_from_infallible {
@@ -68,5 +70,4 @@ macro_rules! impl_from_infallible {
     };
 }
 
-pub(crate) use impl_from_dynamic;
 pub(crate) use impl_from_infallible;

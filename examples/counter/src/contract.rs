@@ -5,9 +5,9 @@
 
 mod state;
 
-use counter::CounterAbi;
+use counter::{CounterAbi, CounterOperation};
 use linera_sdk::{
-    base::WithContractAbi,
+    linera_base_types::WithContractAbi,
     views::{RootView, View},
     Contract, ContractRuntime,
 };
@@ -29,6 +29,7 @@ impl Contract for CounterContract {
     type Message = ();
     type InstantiationArgument = u64;
     type Parameters = ();
+    type EventValue = ();
 
     async fn load(runtime: ContractRuntime<Self>) -> Self {
         let state = CounterState::load(runtime.root_view_storage_context())
@@ -44,8 +45,9 @@ impl Contract for CounterContract {
         self.state.value.set(value);
     }
 
-    async fn execute_operation(&mut self, operation: u64) -> u64 {
-        let new_value = self.state.value.get() + operation;
+    async fn execute_operation(&mut self, operation: CounterOperation) -> u64 {
+        let CounterOperation::Increment { value } = operation;
+        let new_value = self.state.value.get() + value;
         self.state.value.set(new_value);
         new_value
     }
@@ -61,6 +63,7 @@ impl Contract for CounterContract {
 
 #[cfg(test)]
 mod tests {
+    use counter::CounterOperation;
     use futures::FutureExt as _;
     use linera_sdk::{util::BlockingWait, views::View, Contract, ContractRuntime};
 
@@ -72,9 +75,10 @@ mod tests {
         let mut counter = create_and_instantiate_counter(initial_value);
 
         let increment = 42_308_u64;
+        let operation = CounterOperation::Increment { value: increment };
 
         let response = counter
-            .execute_operation(increment)
+            .execute_operation(operation)
             .now_or_never()
             .expect("Execution of counter operation should not await anything");
 
@@ -102,9 +106,10 @@ mod tests {
         let mut counter = create_and_instantiate_counter(initial_value);
 
         let increment = 8_u64;
+        let operation = CounterOperation::Increment { value: increment };
 
         let response = counter
-            .execute_operation(increment)
+            .execute_operation(operation)
             .now_or_never()
             .expect("Execution of counter operation should not await anything");
 

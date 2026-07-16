@@ -45,7 +45,7 @@ impl Specializations {
     /// `witty_specialize_with` attributes.
     ///
     /// The [`DeriveInput`] is changed so that its `where` clause and field types are specialized.
-    /// Returns the[`Specializations`] instance created from parsing the `witty_specialize_with`
+    /// Returns the [`Specializations`] instance created from parsing the `witty_specialize_with`
     /// attributes from the [`DeriveInput`].
     pub fn prepare_derive_input(input: &mut DeriveInput) -> Self {
         let this: Self = Self::parse_specialization_attributes(&input.attrs).collect();
@@ -68,7 +68,7 @@ impl Specializations {
             abort!(
                 span,
                 "Failed to parse Witty specialization attribute. \
-                Expected: `#[witty_specialize_with(TypeParam = Type, ...))]`."
+                Expected: `#[witty_specialize_with(TypeParam = Type, ...)]`."
             );
         };
 
@@ -198,7 +198,7 @@ impl Specializations {
                     }),
             );
 
-        let (generic_parameters, _incorrect_type_generics, _unaltered_where_clasue) =
+        let (generic_parameters, _incorrect_type_generics, _unaltered_where_clause) =
             generics.split_for_impl();
 
         generic_parameters.into_token_stream()
@@ -241,7 +241,7 @@ impl Specialization {
     ///
     /// Note that the specialization is only done to the `where` clause and the type's fields. The
     /// types generic parameters needs to be changed separately (see
-    /// [`Specializatons::specialize_type_generics`].
+    /// [`Specializations::specialize_type_generics`].
     pub fn apply_to_derive_input(&self, input: &mut DeriveInput) {
         self.apply_to_generics(&mut input.generics);
         self.change_types_in_fields(&mut input.data);
@@ -328,7 +328,7 @@ impl Specialization {
                     .iter_mut()
                     .flat_map(|variant| variant.fields.iter_mut()),
             ),
-            _ => Box::new(None.into_iter()),
+            Data::Struct(_) => Box::new(None.into_iter()),
         };
 
         for Field { ty, .. } in fields {
@@ -387,7 +387,7 @@ impl Specialization {
     /// Replaces the [`Self::type_parameter`] with the [`Self::specialized_type`] inside the
     /// [`Path`]'s type arguments.
     fn change_types_in_path(&self, path: &mut Path) {
-        for segment in path.segments.iter_mut() {
+        for segment in &mut path.segments {
             match &mut segment.arguments {
                 PathArguments::None => {}
                 PathArguments::AngleBracketed(angle_bracketed) => {
@@ -407,7 +407,7 @@ impl Specialization {
         &self,
         arguments: &mut AngleBracketedGenericArguments,
     ) {
-        for argument in arguments.args.iter_mut() {
+        for argument in &mut arguments.args {
             match argument {
                 GenericArgument::Type(the_type) => self.change_types_in_type(the_type),
                 GenericArgument::AssocType(AssocType { generics, ty, .. }) => {

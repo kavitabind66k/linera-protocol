@@ -11,9 +11,10 @@ on:
       - 'toolchains/**'
       - 'linera-views/**'
       - 'linera-storage/**'
+      - 'linera-service/src/storage.rs'
   workflow_dispatch:
 
-# This allows a subsequently queued workflow run to interrupt previous runs on pull-requests
+# This allows a subsequently queued workflow run to interrupt previous runs on pull requests
 concurrency:
   group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.run_id }}'
   cancel-in-progress: true
@@ -37,10 +38,10 @@ jobs:
     timeout-minutes: 40
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - uses: actions-rust-lang/setup-rust-toolchain@v1
     - name: Install Protoc
-      uses: arduino/setup-protoc@v1
+      uses: arduino/setup-protoc@v3
       with:
         repo-token: ${{ secrets.GITHUB_TOKEN }}
     - name: Build example applications
@@ -58,6 +59,6 @@ jobs:
         AWS_REGION: us-east-1
         AWS_ACCESS_KEY_ID: test
         AWS_SECRET_ACCESS_KEY: test
-        LOCALSTACK_ENDPOINT: http://localhost:8000
+        DYNAMODB_LOCAL_ENDPOINT: http://localhost:8000
       run: |
         cargo test --locked --features dynamodb -- dynamo

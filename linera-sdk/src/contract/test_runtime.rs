@@ -4,31 +4,47 @@
 //! Runtime types to simulate interfacing with the host executing the contract.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, Mutex, MutexGuard},
 };
 
 use linera_base::{
     abi::{ContractAbi, ServiceAbi},
     data_types::{
-        Amount, ApplicationPermissions, BlockHeight, Resources, SendMessageRequest, Timestamp,
+        Amount, ApplicationPermissions, BlockHeight, Bytecode, Resources, SendMessageRequest,
+        Timestamp,
     },
+    ensure, http,
     identifiers::{
-        Account, AccountOwner, ApplicationId, BytecodeId, ChainId, ChannelName, Destination,
-        MessageId, Owner, StreamName,
+        Account, AccountOwner, ApplicationId, BlobId, ChainId, DataBlobHash, ModuleId, StreamName,
     },
-    ownership::{ChainOwnership, CloseChainError},
+    ownership::{
+        AccountPermissionError, ChainOwnership, ChangeApplicationPermissionsError, CloseChainError,
+    },
+    vm::VmRuntime,
 };
 use serde::Serialize;
 
-use crate::{Contract, DataBlobHash, KeyValueStore, ViewStorageContext};
+use crate::{Contract, KeyValueStore, ViewStorageContext};
+
+struct ExpectedPublishModuleCall {
+    contract: Bytecode,
+    service: Bytecode,
+    vm_runtime: VmRuntime,
+    module_id: ModuleId,
+}
 
 struct ExpectedCreateApplicationCall {
-    bytecode_id: BytecodeId,
+    module_id: ModuleId,
     parameters: Vec<u8>,
     argument: Vec<u8>,
     required_application_ids: Vec<ApplicationId>,
     application_id: ApplicationId,
+}
+
+struct ExpectedCreateDataBlobCall {
+    bytes: Vec<u8>,
+    blob_id: BlobId,
 }
 
 /// A mock of the common runtime to interface with the host executing the contract.
@@ -40,30 +56,33 @@ where
     application_id: Option<ApplicationId<Application::Abi>>,
     application_creator_chain_id: Option<ChainId>,
     chain_id: Option<ChainId>,
-    authenticated_signer: Option<Option<Owner>>,
+    authenticated_owner: Option<Option<AccountOwner>>,
     block_height: Option<BlockHeight>,
-    message_id: Option<Option<MessageId>>,
+    round: Option<u32>,
     message_is_bouncing: Option<Option<bool>>,
+    message_origin_chain_id: Option<Option<ChainId>>,
     authenticated_caller_id: Option<Option<ApplicationId>>,
     timestamp: Option<Timestamp>,
     chain_balance: Option<Amount>,
     owner_balances: Option<HashMap<AccountOwner, Amount>>,
     chain_ownership: Option<ChainOwnership>,
     can_close_chain: Option<bool>,
+    can_change_application_permissions: Option<bool>,
     call_application_handler: Option<CallApplicationHandler>,
     send_message_requests: Arc<Mutex<Vec<SendMessageRequest<Application::Message>>>>,
-    subscribe_requests: Vec<(ChainId, ChannelName)>,
-    unsubscribe_requests: Vec<(ChainId, ChannelName)>,
     outgoing_transfers: HashMap<Account, Amount>,
-    events: Vec<(StreamName, Vec<u8>, Vec<u8>)>,
+    created_events: BTreeMap<StreamName, Vec<Vec<u8>>>,
+    events: BTreeMap<(ChainId, StreamName, u32), Vec<u8>>,
     claim_requests: Vec<ClaimRequest>,
     expected_service_queries: VecDeque<(ApplicationId, String, String)>,
-    expected_post_requests: VecDeque<(String, Vec<u8>, Vec<u8>)>,
+    expected_http_requests: VecDeque<(http::Request, http::Response)>,
     expected_read_data_blob_requests: VecDeque<(DataBlobHash, Vec<u8>)>,
     expected_assert_data_blob_exists_requests: VecDeque<(DataBlobHash, Option<()>)>,
-    expected_open_chain_calls:
-        VecDeque<(ChainOwnership, ApplicationPermissions, Amount, MessageId)>,
+    expected_has_empty_storage_requests: VecDeque<(ApplicationId, bool)>,
+    expected_open_chain_calls: VecDeque<(ChainOwnership, ApplicationPermissions, Amount, ChainId)>,
+    expected_publish_module_calls: VecDeque<ExpectedPublishModuleCall>,
     expected_create_application_calls: VecDeque<ExpectedCreateApplicationCall>,
+    expected_create_data_blob_calls: VecDeque<ExpectedCreateDataBlobCall>,
     key_value_store: KeyValueStore,
 }
 
@@ -87,29 +106,33 @@ where
             application_id: None,
             application_creator_chain_id: None,
             chain_id: None,
-            authenticated_signer: None,
+            authenticated_owner: None,
             block_height: None,
-            message_id: None,
+            round: None,
             message_is_bouncing: None,
+            message_origin_chain_id: None,
             authenticated_caller_id: None,
             timestamp: None,
             chain_balance: None,
             owner_balances: None,
             chain_ownership: None,
             can_close_chain: None,
+            can_change_application_permissions: None,
             call_application_handler: None,
             send_message_requests: Arc::default(),
-            subscribe_requests: Vec::new(),
-            unsubscribe_requests: Vec::new(),
             outgoing_transfers: HashMap::new(),
-            events: Vec::new(),
+            created_events: BTreeMap::new(),
+            events: BTreeMap::new(),
             claim_requests: Vec::new(),
             expected_service_queries: VecDeque::new(),
-            expected_post_requests: VecDeque::new(),
+            expected_http_requests: VecDeque::new(),
             expected_read_data_blob_requests: VecDeque::new(),
             expected_assert_data_blob_exists_requests: VecDeque::new(),
+            expected_has_empty_storage_requests: VecDeque::new(),
             expected_open_chain_calls: VecDeque::new(),
+            expected_publish_module_calls: VecDeque::new(),
             expected_create_application_calls: VecDeque::new(),
+            expected_create_data_blob_calls: VecDeque::new(),
             key_value_store: KeyValueStore::mock().to_mut(),
         }
     }
@@ -121,7 +144,7 @@ where
 
     /// Returns a storage context suitable for a root view.
     pub fn root_view_storage_context(&self) -> ViewStorageContext {
-        ViewStorageContext::new_unsafe(self.key_value_store(), Vec::new(), ())
+        ViewStorageContext::new_unchecked(self.key_value_store(), Vec::new(), ())
     }
 
     /// Configures the application parameters to return during the test.
@@ -213,29 +236,29 @@ where
         )
     }
 
-    /// Configures the authenticated signer to return during the test.
-    pub fn with_authenticated_signer(
+    /// Configures the authenticated owner to return during the test.
+    pub fn with_authenticated_owner(
         mut self,
-        authenticated_signer: impl Into<Option<Owner>>,
+        authenticated_owner: impl Into<Option<AccountOwner>>,
     ) -> Self {
-        self.authenticated_signer = Some(authenticated_signer.into());
+        self.authenticated_owner = Some(authenticated_owner.into());
         self
     }
 
-    /// Configures the authenticated signer to return during the test.
-    pub fn set_authenticated_signer(
+    /// Configures the authenticated owner to return during the test.
+    pub fn set_authenticated_owner(
         &mut self,
-        authenticated_signer: impl Into<Option<Owner>>,
+        authenticated_owner: impl Into<Option<AccountOwner>>,
     ) -> &mut Self {
-        self.authenticated_signer = Some(authenticated_signer.into());
+        self.authenticated_owner = Some(authenticated_owner.into());
         self
     }
 
-    /// Returns the authenticated signer for this execution, if there is one.
-    pub fn authenticated_signer(&mut self) -> Option<Owner> {
-        self.authenticated_signer.expect(
-            "Authenticated signer has not been mocked, \
-            please call `MockContractRuntime::set_authenticated_signer` first",
+    /// Returns the authenticated owner for this execution, if there is one.
+    pub fn authenticated_owner(&mut self) -> Option<AccountOwner> {
+        self.authenticated_owner.expect(
+            "Authenticated owner has not been mocked, \
+            please call `MockContractRuntime::set_authenticated_owner` first",
         )
     }
 
@@ -251,32 +274,23 @@ where
         self
     }
 
+    /// Configures the multi-leader round number to return during the test.
+    pub fn with_round(mut self, round: u32) -> Self {
+        self.round = Some(round);
+        self
+    }
+
+    /// Configures the multi-leader round number to return during the test.
+    pub fn set_round(&mut self, round: u32) -> &mut Self {
+        self.round = Some(round);
+        self
+    }
+
     /// Returns the height of the current block that is executing.
     pub fn block_height(&mut self) -> BlockHeight {
         self.block_height.expect(
             "Block height has not been mocked, \
             please call `MockContractRuntime::set_block_height` first",
-        )
-    }
-
-    /// Configures the message ID to return during the test.
-    pub fn with_message_id(mut self, message_id: impl Into<Option<MessageId>>) -> Self {
-        self.message_id = Some(message_id.into());
-        self
-    }
-
-    /// Configures the message ID to return during the test.
-    pub fn set_message_id(&mut self, message_id: impl Into<Option<MessageId>>) -> &mut Self {
-        self.message_id = Some(message_id.into());
-        self
-    }
-
-    /// Returns the ID of the incoming message that is being handled, or [`None`] if not executing
-    /// an incoming message.
-    pub fn message_id(&mut self) -> Option<MessageId> {
-        self.message_id.expect(
-            "Message ID has not been mocked, \
-            please call `MockContractRuntime::set_message_id` first",
         )
     }
 
@@ -307,6 +321,24 @@ where
         )
     }
 
+    /// Configures the `message_origin_chain_id` to return during the test.
+    pub fn set_message_origin_chain_id(
+        &mut self,
+        message_origin_chain_id: impl Into<Option<ChainId>>,
+    ) -> &mut Self {
+        self.message_origin_chain_id = Some(message_origin_chain_id.into());
+        self
+    }
+
+    /// Returns the chain ID where the incoming message originated from, or [`None`] if not
+    /// executing an incoming message.
+    pub fn message_origin_chain_id(&mut self) -> Option<ChainId> {
+        self.message_origin_chain_id.expect(
+            "`message_origin_chain_id` has not been mocked, \
+            please call `MockContractRuntime::set_message_origin_chain_id` first",
+        )
+    }
+
     /// Configures the authenticated caller ID to return during the test.
     pub fn with_authenticated_caller_id(
         mut self,
@@ -332,6 +364,19 @@ where
             "Authenticated caller ID has not been mocked, \
             please call `MockContractRuntime::set_authenticated_caller_id` first",
         )
+    }
+
+    /// Verifies that the current execution context authorizes operations on a given account.
+    pub fn check_account_permission(
+        &mut self,
+        owner: AccountOwner,
+    ) -> Result<(), AccountPermissionError> {
+        ensure!(
+            self.authenticated_owner() == Some(owner)
+                || self.authenticated_caller_id().map(AccountOwner::from) == Some(owner),
+            AccountPermissionError::NotPermitted(owner)
+        );
+        Ok(())
     }
 
     /// Configures the system time to return during the test.
@@ -435,11 +480,7 @@ where
     }
 
     /// Schedules a message to be sent to this application on another chain.
-    pub fn send_message(
-        &mut self,
-        destination: impl Into<Destination>,
-        message: Application::Message,
-    ) {
+    pub fn send_message(&mut self, destination: ChainId, message: Application::Message) {
         self.prepare_message(message).send_to(destination)
     }
 
@@ -460,29 +501,9 @@ where
             .expect("Unit test should be single-threaded")
     }
 
-    /// Subscribes to a message channel from another chain.
-    pub fn subscribe(&mut self, chain: ChainId, channel: ChannelName) {
-        self.subscribe_requests.push((chain, channel));
-    }
-
-    /// Returns the list of requests to subscribe to channels made in the test so far.
-    pub fn subscribe_requests(&self) -> &[(ChainId, ChannelName)] {
-        &self.subscribe_requests
-    }
-
-    /// Unsubscribes to a message channel from another chain.
-    pub fn unsubscribe(&mut self, chain: ChainId, channel: ChannelName) {
-        self.unsubscribe_requests.push((chain, channel));
-    }
-
-    /// Returns the list of requests to unsubscribe to channels made in the test so far.
-    pub fn unsubscribe_requests(&self) -> &[(ChainId, ChannelName)] {
-        &self.unsubscribe_requests
-    }
-
     /// Transfers an `amount` of native tokens from `source` owner account (or the current chain's
     /// balance) to `destination`.
-    pub fn transfer(&mut self, source: Option<AccountOwner>, destination: Account, amount: Amount) {
+    pub fn transfer(&mut self, source: AccountOwner, destination: Account, amount: Amount) {
         self.debit(source, amount);
 
         if Some(destination.chain_id) == self.chain_id {
@@ -497,10 +518,11 @@ where
 
     /// Debits an `amount` of native tokens from a `source` owner account (or the current
     /// chain's balance).
-    fn debit(&mut self, source: Option<AccountOwner>, amount: Amount) {
-        let source_balance = match source {
-            Some(owner) => self.owner_balance_mut(owner),
-            None => self.chain_balance_mut(),
+    fn debit(&mut self, source: AccountOwner, amount: Amount) {
+        let source_balance = if source == AccountOwner::CHAIN {
+            self.chain_balance_mut()
+        } else {
+            self.owner_balance_mut(source)
         };
 
         *source_balance = source_balance
@@ -510,10 +532,11 @@ where
 
     /// Credits an `amount` of native tokens into a `destination` owner account (or the
     /// current chain's balance).
-    fn credit(&mut self, destination: Option<AccountOwner>, amount: Amount) {
-        let destination_balance = match destination {
-            Some(owner) => self.owner_balance_mut(owner),
-            None => self.chain_balance_mut(),
+    fn credit(&mut self, destination: AccountOwner, amount: Amount) {
+        let destination_balance = if destination == AccountOwner::CHAIN {
+            self.chain_balance_mut()
+        } else {
+            self.owner_balance_mut(destination)
         };
 
         *destination_balance = destination_balance
@@ -580,6 +603,26 @@ where
         self
     }
 
+    /// Configures if the application being tested is allowed to change the application
+    /// permissions on the chain.
+    pub fn with_can_change_application_permissions(
+        mut self,
+        can_change_application_permissions: bool,
+    ) -> Self {
+        self.can_change_application_permissions = Some(can_change_application_permissions);
+        self
+    }
+
+    /// Configures if the application being tested is allowed to change the application
+    /// permissions on the chain.
+    pub fn set_can_change_application_permissions(
+        &mut self,
+        can_change_application_permissions: bool,
+    ) -> &mut Self {
+        self.can_change_application_permissions = Some(can_change_application_permissions);
+        self
+    }
+
     /// Closes the current chain. Returns an error if the application doesn't have
     /// permission to do so.
     pub fn close_chain(&mut self) -> Result<(), CloseChainError> {
@@ -595,19 +638,44 @@ where
         }
     }
 
-    /// Adds an expected call to `open_chain`, and the message ID that should be returned.
+    /// Changes the application permissions on the current chain. Returns an error if the
+    /// application doesn't have permission to do so.
+    pub fn change_application_permissions(
+        &mut self,
+        application_permissions: ApplicationPermissions,
+    ) -> Result<(), ChangeApplicationPermissionsError> {
+        let authorized = self.can_change_application_permissions.expect(
+            "Authorization to change the application permissions has not been mocked, \
+            please call `MockContractRuntime::set_can_change_application_permissions` first",
+        );
+
+        if authorized {
+            let application_id = self
+                .application_id
+                .expect("The application doesn't have an ID!")
+                .forget_abi();
+            self.can_close_chain = Some(application_permissions.can_close_chain(&application_id));
+            self.can_change_application_permissions =
+                Some(application_permissions.can_change_application_permissions(&application_id));
+            Ok(())
+        } else {
+            Err(ChangeApplicationPermissionsError::NotPermitted)
+        }
+    }
+
+    /// Adds an expected call to `open_chain`, and the child chain ID that should be returned.
     pub fn add_expected_open_chain_call(
         &mut self,
         ownership: ChainOwnership,
         application_permissions: ApplicationPermissions,
         balance: Amount,
-        message_id: MessageId,
+        chain_id: ChainId,
     ) {
         self.expected_open_chain_calls.push_back((
             ownership,
             application_permissions,
             balance,
-            message_id,
+            chain_id,
         ));
     }
 
@@ -618,35 +686,54 @@ where
         ownership: ChainOwnership,
         application_permissions: ApplicationPermissions,
         balance: Amount,
-    ) -> (MessageId, ChainId) {
-        let (expected_ownership, expected_permissions, expected_balance, message_id) = self
+    ) -> ChainId {
+        let (expected_ownership, expected_permissions, expected_balance, chain_id) = self
             .expected_open_chain_calls
             .pop_front()
             .expect("Unexpected open_chain call");
         assert_eq!(ownership, expected_ownership);
         assert_eq!(application_permissions, expected_permissions);
         assert_eq!(balance, expected_balance);
-        let chain_id = ChainId::child(message_id);
-        (message_id, chain_id)
+        chain_id
+    }
+
+    /// Adds a new expected call to `publish_module`.
+    pub fn add_expected_publish_module_call(
+        &mut self,
+        contract: Bytecode,
+        service: Bytecode,
+        vm_runtime: VmRuntime,
+        module_id: ModuleId,
+    ) {
+        self.expected_publish_module_calls
+            .push_back(ExpectedPublishModuleCall {
+                contract,
+                service,
+                vm_runtime,
+                module_id,
+            });
     }
 
     /// Adds a new expected call to `create_application`.
-    pub fn add_expected_create_application_call<A: Contract>(
+    pub fn add_expected_create_application_call<Parameters, InstantiationArgument>(
         &mut self,
-        bytecode_id: BytecodeId,
-        parameters: &A::Parameters,
-        argument: &A::InstantiationArgument,
+        module_id: ModuleId,
+        parameters: &Parameters,
+        argument: &InstantiationArgument,
         required_application_ids: Vec<ApplicationId>,
         application_id: ApplicationId,
-    ) {
-        let parameters = bcs::to_bytes(parameters)
+    ) where
+        Parameters: Serialize,
+        InstantiationArgument: Serialize,
+    {
+        let parameters = serde_json::to_vec(parameters)
             .expect("Failed to serialize `Parameters` type for a cross-application call");
-        let argument = bcs::to_bytes(argument).expect(
+        let argument = serde_json::to_vec(argument).expect(
             "Failed to serialize `InstantiationArgument` type for a cross-application call",
         );
         self.expected_create_application_calls
             .push_back(ExpectedCreateApplicationCall {
-                bytecode_id,
+                module_id,
                 parameters,
                 argument,
                 required_application_ids,
@@ -654,16 +741,49 @@ where
             });
     }
 
-    /// Creates a new on-chain application, based on the supplied bytecode and parameters.
-    pub fn create_application<A: Contract>(
+    /// Adds a new expected call to `create_data_blob`.
+    pub fn add_expected_create_data_blob_call(&mut self, bytes: Vec<u8>, blob_id: BlobId) {
+        self.expected_create_data_blob_calls
+            .push_back(ExpectedCreateDataBlobCall { bytes, blob_id });
+    }
+
+    /// Creates a new module-id on-chain application, based on the supplied bytecode and parameters.
+    pub fn publish_module(
         &mut self,
-        bytecode_id: BytecodeId,
-        parameters: &A::Parameters,
-        argument: &A::InstantiationArgument,
+        contract: Bytecode,
+        service: Bytecode,
+        vm_runtime: VmRuntime,
+    ) -> ModuleId {
+        let ExpectedPublishModuleCall {
+            contract: expected_contract,
+            service: expected_service,
+            vm_runtime: expected_vm_runtime,
+            module_id,
+        } = self
+            .expected_publish_module_calls
+            .pop_front()
+            .expect("Unexpected publish_module call");
+        assert_eq!(contract, expected_contract);
+        assert_eq!(service, expected_service);
+        assert_eq!(vm_runtime, expected_vm_runtime);
+        module_id
+    }
+
+    /// Creates a new on-chain application, based on the supplied module and parameters.
+    pub fn create_application<Abi, Parameters, InstantiationArgument>(
+        &mut self,
+        module_id: ModuleId,
+        parameters: &Parameters,
+        argument: &InstantiationArgument,
         required_application_ids: Vec<ApplicationId>,
-    ) -> ApplicationId<A::Abi> {
+    ) -> ApplicationId<Abi>
+    where
+        Abi: ContractAbi,
+        Parameters: Serialize,
+        InstantiationArgument: Serialize,
+    {
         let ExpectedCreateApplicationCall {
-            bytecode_id: expected_bytecode_id,
+            module_id: expected_module_id,
             parameters: expected_parameters,
             argument: expected_argument,
             required_application_ids: expected_required_app_ids,
@@ -672,16 +792,29 @@ where
             .expected_create_application_calls
             .pop_front()
             .expect("Unexpected create_application call");
-        let parameters = bcs::to_bytes(parameters)
+        let parameters = serde_json::to_vec(parameters)
             .expect("Failed to serialize `Parameters` type for a cross-application call");
-        let argument = bcs::to_bytes(argument).expect(
+        let argument = serde_json::to_vec(argument).expect(
             "Failed to serialize `InstantiationArgument` type for a cross-application call",
         );
-        assert_eq!(bytecode_id, expected_bytecode_id);
+        assert_eq!(module_id, expected_module_id);
         assert_eq!(parameters, expected_parameters);
         assert_eq!(argument, expected_argument);
         assert_eq!(required_application_ids, expected_required_app_ids);
-        application_id.with_abi::<A::Abi>()
+        application_id.with_abi::<Abi>()
+    }
+
+    /// Creates a new data blob and returns its hash.
+    pub fn create_data_blob(&mut self, bytes: &[u8]) -> DataBlobHash {
+        let ExpectedCreateDataBlobCall {
+            bytes: expected_bytes,
+            blob_id,
+        } = self
+            .expected_create_data_blob_calls
+            .pop_front()
+            .expect("Unexpected create_data_blob call");
+        assert_eq!(bytes, &expected_bytes);
+        DataBlobHash(blob_id.hash)
     }
 
     /// Configures the handler for cross-application calls made during the test.
@@ -709,8 +842,8 @@ where
         application: ApplicationId<A>,
         call: &A::Operation,
     ) -> A::Response {
-        let call_bytes = bcs::to_bytes(call)
-            .expect("Failed to serialize `Operation` type for a cross-application call");
+        let call_bytes = A::serialize_operation(call)
+            .expect("Failed to serialize `Operation` in test runtime cross-application call");
 
         let handler = self.call_application_handler.as_mut().expect(
             "Handler for `call_application` has not been mocked, \
@@ -718,13 +851,57 @@ where
         );
         let response_bytes = handler(authenticated, application.forget_abi(), call_bytes);
 
-        bcs::from_bytes(&response_bytes)
-            .expect("Failed to deserialize `Response` type from cross-application call")
+        A::deserialize_response(response_bytes)
+            .expect("Failed to deserialize `Response` in test runtime cross-application call")
     }
 
-    /// Adds a new item to an event stream.
-    pub fn emit(&mut self, name: StreamName, key: &[u8], value: &[u8]) {
-        self.events.push((name, key.to_vec(), value.to_vec()));
+    /// Adds a new item to an event stream. Returns the new event's index in the stream.
+    pub fn emit(&mut self, name: StreamName, value: &Application::EventValue) -> u32 {
+        let value = bcs::to_bytes(value).expect("Failed to serialize event value");
+        let entry = self.created_events.entry(name).or_default();
+        entry.push(value);
+        entry.len() as u32 - 1
+    }
+
+    /// Adds an event to a stream, so that it can be read using `read_event`.
+    pub fn add_event(&mut self, chain_id: ChainId, name: StreamName, index: u32, value: &[u8]) {
+        self.events.insert((chain_id, name, index), value.to_vec());
+    }
+
+    /// Reads an event from a stream. Returns the event's value.
+    ///
+    /// Panics if the event doesn't exist.
+    pub fn read_event(
+        &mut self,
+        chain_id: ChainId,
+        name: StreamName,
+        index: u32,
+    ) -> Application::EventValue {
+        let value = self
+            .events
+            .get(&(chain_id, name, index))
+            .expect("Event not found");
+        bcs::from_bytes(value).expect("Failed to deserialize event value")
+    }
+
+    /// Subscribes this application to an event stream.
+    pub fn subscribe_to_events(
+        &mut self,
+        _chain_id: ChainId,
+        _application_id: ApplicationId,
+        _name: StreamName,
+    ) {
+        // This is a no-op in the mock runtime.
+    }
+
+    /// Unsubscribes this application from an event stream.
+    pub fn unsubscribe_from_events(
+        &mut self,
+        _chain_id: ChainId,
+        _application_id: ApplicationId,
+        _name: StreamName,
+    ) {
+        // This is a no-op in the mock runtime.
     }
 
     /// Adds an expected `query_service` call`, and the response it should return in the test.
@@ -740,10 +917,9 @@ where
             .push_back((application_id.forget_abi(), query, response));
     }
 
-    /// Adds an expected `http_post` call, and the response it should return in the test.
-    pub fn add_expected_post_request(&mut self, url: String, payload: Vec<u8>, response: Vec<u8>) {
-        self.expected_post_requests
-            .push_back((url, payload, response));
+    /// Adds an expected `http_request` call, and the response it should return in the test.
+    pub fn add_expected_http_request(&mut self, request: http::Request, response: http::Response) {
+        self.expected_http_requests.push_back((request, response));
     }
 
     /// Adds an expected `read_data_blob` call, and the response it should return in the test.
@@ -762,6 +938,16 @@ where
             .push_back((hash, response));
     }
 
+    /// Adds an expected `has_empty_storage` call, and the response it should return in the test.
+    pub fn add_expected_has_empty_storage_requests(
+        &mut self,
+        application: ApplicationId,
+        response: bool,
+    ) {
+        self.expected_has_empty_storage_requests
+            .push_back((application, response));
+    }
+
     /// Queries an application service as an oracle and returns the response.
     ///
     /// Should only be used with queries where it is very likely that all validators will compute
@@ -772,30 +958,28 @@ where
     pub fn query_service<A: ServiceAbi + Send>(
         &mut self,
         application_id: ApplicationId<A>,
-        query: A::Query,
+        query: &A::Query,
     ) -> A::QueryResponse {
         let maybe_query = self.expected_service_queries.pop_front();
         let (expected_id, expected_query, response) =
             maybe_query.expect("Unexpected service query");
         assert_eq!(application_id.forget_abi(), expected_id);
-        let query = serde_json::to_string(&query).expect("Failed to serialize query");
+        let query = serde_json::to_string(query).expect("Failed to serialize query");
         assert_eq!(query, expected_query);
         serde_json::from_str(&response).expect("Failed to deserialize response")
     }
 
-    /// Makes a GET request to the given URL as an oracle and returns the JSON part, if any.
+    /// Makes an HTTP `request` as an oracle and returns the HTTP response.
     ///
     /// Should only be used with queries where it is very likely that all validators will receive
     /// the same response, otherwise most block proposals will fail.
     ///
     /// Cannot be used in fast blocks: A block using this call should be proposed by a regular
     /// owner, not a super owner.
-    pub fn http_post(&mut self, url: &str, payload: Vec<u8>) -> Vec<u8> {
-        let maybe_request = self.expected_post_requests.pop_front();
-        let (expected_url, expected_payload, response) =
-            maybe_request.expect("Unexpected POST request");
-        assert_eq!(*url, expected_url);
-        assert_eq!(payload, expected_payload);
+    pub fn http_request(&mut self, request: http::Request) -> http::Response {
+        let maybe_request = self.expected_http_requests.pop_front();
+        let (expected_request, response) = maybe_request.expect("Unexpected HTTP request");
+        assert_eq!(request, expected_request);
         response
     }
 
@@ -809,10 +993,10 @@ where
     }
 
     /// Reads a data blob with the given hash from storage.
-    pub fn read_data_blob(&mut self, hash: &DataBlobHash) -> Vec<u8> {
+    pub fn read_data_blob(&mut self, hash: DataBlobHash) -> Vec<u8> {
         let maybe_request = self.expected_read_data_blob_requests.pop_front();
         let (expected_hash, response) = maybe_request.expect("Unexpected read_data_blob request");
-        assert_eq!(*hash, expected_hash);
+        assert_eq!(hash, expected_hash);
         response
     }
 
@@ -823,6 +1007,20 @@ where
             maybe_request.expect("Unexpected assert_data_blob_exists request");
         assert_eq!(hash, expected_blob_hash);
         response.expect("Blob does not exist!");
+    }
+
+    /// Returns true if the corresponding contract uses a zero amount of storage.
+    pub fn has_empty_storage(&mut self, application: ApplicationId) -> bool {
+        let maybe_request = self.expected_has_empty_storage_requests.pop_front();
+        let (expected_application_id, response) =
+            maybe_request.expect("Unexpected has_empty_storage request");
+        assert_eq!(application, expected_application_id);
+        response
+    }
+
+    /// Returns the multi-leader round in which this block was validated.
+    pub fn validation_round(&mut self) -> Option<u32> {
+        self.round
     }
 }
 
@@ -868,7 +1066,7 @@ where
         self
     }
 
-    /// Forwards the authenticated signer with the message.
+    /// Forwards the authenticated owner with the message.
     pub fn with_authentication(mut self) -> Self {
         self.authenticated = true;
         self
@@ -881,9 +1079,9 @@ where
     }
 
     /// Schedules this `Message` to be sent to the `destination`.
-    pub fn send_to(self, destination: impl Into<Destination>) {
+    pub fn send_to(self, destination: ChainId) {
         let request = SendMessageRequest {
-            destination: destination.into(),
+            destination,
             authenticated: self.authenticated,
             is_tracked: self.is_tracked,
             grant: self.grant,

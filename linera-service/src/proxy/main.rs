@@ -1,18 +1,37 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#![deny(clippy::large_futures)]
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// jemalloc configuration for memory profiling with jemalloc_pprof
+// prof:true - Enable profiling infrastructure
+// prof_active:false - Sampling disabled by default, enabled via --enable-memory-profiling
+// lg_prof_sample:19 - Sample every 512KB for good detail/overhead balance
+
+// Linux/other platforms: use unprefixed malloc (with unprefixed_malloc_on_supported_platforms)
+#[cfg(all(feature = "jemalloc", not(target_os = "macos")))]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
+
+// macOS: use prefixed malloc (without unprefixed_malloc_on_supported_platforms)
+#[cfg(all(feature = "jemalloc", target_os = "macos"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use async_trait::async_trait;
 use futures::{FutureExt as _, SinkExt, StreamExt};
-use linera_client::{
-    config::{GenesisConfig, ValidatorServerConfig},
-    storage::{run_with_storage, Runnable, StorageConfigNamespace},
-};
+use linera_base::listen_for_shutdown_signals;
+use linera_client::config::ValidatorServerConfig;
 use linera_core::{node::NodeError, JoinSetExt as _};
+#[cfg(with_metrics)]
+use linera_metrics::monitoring_server;
 use linera_rpc::{
     config::{
         NetworkProtocol, ShardConfig, ValidatorInternalNetworkPreConfig,
@@ -21,12 +40,12 @@ use linera_rpc::{
     simple::{MessageHandler, TransportProtocol},
     RpcMessage,
 };
-use linera_sdk::base::Blob;
-#[cfg(with_metrics)]
-use linera_service::prometheus_server;
-use linera_service::util;
-use linera_storage::Storage;
-use linera_views::store::CommonStoreConfig;
+use linera_sdk::linera_base_types::Blob;
+use linera_service::{
+    storage::{CommonStorageOptions, Runnable, StorageConfig},
+    util,
+};
+use linera_storage::{ResultReadCertificates, Storage};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, instrument};
@@ -46,36 +65,47 @@ pub struct ProxyOptions {
     config_path: PathBuf,
 
     /// Timeout for sending queries (ms)
-    #[arg(long = "send-timeout-ms", default_value = "4000", value_parser = util::parse_millis)]
+    #[arg(long = "send-timeout-ms",
+          default_value = "4000",
+          value_parser = util::parse_millis,
+          env = "LINERA_PROXY_SEND_TIMEOUT")]
     send_timeout: Duration,
 
     /// Timeout for receiving responses (ms)
-    #[arg(long = "recv-timeout-ms", default_value = "4000", value_parser = util::parse_millis)]
+    #[arg(long = "recv-timeout-ms",
+          default_value = "4000",
+          value_parser = util::parse_millis,
+          env = "LINERA_PROXY_RECV_TIMEOUT")]
     recv_timeout: Duration,
 
     /// The number of Tokio worker threads to use.
     #[arg(long, env = "LINERA_PROXY_TOKIO_THREADS")]
     tokio_threads: Option<usize>,
 
+    /// The number of Tokio blocking threads to use.
+    #[arg(long, env = "LINERA_PROXY_TOKIO_BLOCKING_THREADS")]
+    tokio_blocking_threads: Option<usize>,
+
     /// Storage configuration for the blockchain history, chain states and binary blobs.
     #[arg(long = "storage")]
-    storage_config: StorageConfigNamespace,
+    storage_config: StorageConfig,
 
-    /// The maximal number of simultaneous queries to the database
+    /// Common storage options.
+    #[command(flatten)]
+    common_storage_options: CommonStorageOptions,
+
+    /// Runs a specific proxy instance.
     #[arg(long)]
-    max_concurrent_queries: Option<usize>,
+    id: Option<usize>,
 
-    /// The maximal number of stream queries to the database
-    #[arg(long, default_value = "10")]
-    max_stream_queries: usize,
+    /// OpenTelemetry OTLP exporter endpoint (requires opentelemetry feature).
+    #[arg(long, env = "LINERA_OTLP_EXPORTER_ENDPOINT")]
+    otlp_exporter_endpoint: Option<String>,
 
-    /// The maximal number of entries in the storage cache.
-    #[arg(long, default_value = "1000")]
-    cache_size: usize,
-
-    /// Path to the file describing the initial user chains (aka genesis state)
-    #[arg(long = "genesis")]
-    genesis_config_path: PathBuf,
+    /// Enable memory profiling (requires jemalloc feature and metrics).
+    /// Exposes /debug/pprof and /debug/flamegraph endpoints on the metrics server.
+    #[arg(long, env = "LINERA_ENABLE_MEMORY_PROFILING")]
+    enable_memory_profiling: bool,
 }
 
 /// A Linera Proxy, either gRPC or over 'Simple Transport', meaning TCP or UDP.
@@ -91,20 +121,21 @@ where
 
 struct ProxyContext {
     config: ValidatorServerConfig,
-    genesis_config: GenesisConfig,
     send_timeout: Duration,
     recv_timeout: Duration,
+    id: usize,
+    enable_memory_profiling: bool,
 }
 
 impl ProxyContext {
     pub fn from_options(options: &ProxyOptions) -> Result<Self> {
         let config = util::read_json(&options.config_path)?;
-        let genesis_config = util::read_json(&options.genesis_config_path)?;
         Ok(Self {
             config,
             send_timeout: options.send_timeout,
             recv_timeout: options.recv_timeout,
-            genesis_config,
+            id: options.id.unwrap_or(0),
+            enable_memory_profiling: options.enable_memory_profiling,
         })
     }
 }
@@ -117,12 +148,35 @@ impl Runnable for ProxyContext {
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
+        // Activate memory profiling if requested
+        if self.enable_memory_profiling {
+            #[cfg(feature = "jemalloc")]
+            {
+                linera_metrics::memory_profiler::MemoryProfiler::activate()
+                    .await
+                    .expect("Failed to activate memory profiling");
+            }
+            #[cfg(not(feature = "jemalloc"))]
+            {
+                bail!("--enable-memory-profiling requires the binary to be compiled with the 'jemalloc' feature");
+            }
+        }
+
         let shutdown_notifier = CancellationToken::new();
-        tokio::spawn(util::listen_for_shutdown_signals(shutdown_notifier.clone()));
+        tokio::spawn(listen_for_shutdown_signals(shutdown_notifier.clone()));
+        let enable_memory_profiling = self.enable_memory_profiling;
         let proxy = Proxy::from_context(self, storage)?;
         match proxy {
-            Proxy::Simple(simple_proxy) => simple_proxy.run(shutdown_notifier).await,
-            Proxy::Grpc(grpc_proxy) => grpc_proxy.run(shutdown_notifier).await,
+            Proxy::Simple(simple_proxy) => {
+                simple_proxy
+                    .run(shutdown_notifier, enable_memory_profiling)
+                    .await
+            }
+            Proxy::Grpc(grpc_proxy) => {
+                grpc_proxy
+                    .run(shutdown_notifier, enable_memory_profiling)
+                    .await
+            }
         }
     }
 }
@@ -138,13 +192,12 @@ where
         let proxy = match (internal_protocol, external_protocol) {
             (NetworkProtocol::Grpc { .. }, NetworkProtocol::Grpc(tls)) => {
                 Self::Grpc(GrpcProxy::new(
-                    context.config.validator.network,
                     context.config.internal_network,
-                    context.genesis_config,
                     context.send_timeout,
                     context.recv_timeout,
                     tls,
                     storage,
+                    context.id,
                 ))
             }
             (
@@ -160,10 +213,10 @@ where
                     .validator
                     .network
                     .clone_with_protocol(public_transport),
-                genesis_config: context.genesis_config,
                 send_timeout: context.send_timeout,
                 recv_timeout: context.recv_timeout,
                 storage,
+                id: context.id,
             })),
             _ => {
                 bail!(
@@ -185,10 +238,10 @@ where
 {
     public_config: ValidatorPublicNetworkPreConfig<TransportProtocol>,
     internal_config: ValidatorInternalNetworkPreConfig<TransportProtocol>,
-    genesis_config: GenesisConfig,
     send_timeout: Duration,
     recv_timeout: Duration,
     storage: S,
+    id: usize,
 }
 
 #[async_trait]
@@ -229,7 +282,7 @@ where
         {
             Ok(maybe_response) => maybe_response,
             Err(error) => {
-                error!(error = %error, "Failed to proxy message to {}", shard.address());
+                error!(%error, "Failed to proxy message to {}", shard.address());
                 None
             }
         }
@@ -240,16 +293,21 @@ impl<S> SimpleProxy<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    #[instrument(name = "SimpleProxy::run", skip_all, fields(port = self.public_config.port, metrics_port = self.internal_config.metrics_port), err)]
-    async fn run(self, shutdown_signal: CancellationToken) -> Result<()> {
-        info!("Starting simple server");
+    #[instrument(name = "SimpleProxy::run", skip_all, fields(port = self.public_config.port, metrics_port = self.metrics_port()), err)]
+    async fn run(
+        self,
+        shutdown_signal: CancellationToken,
+        _enable_memory_profiling: bool,
+    ) -> Result<()> {
+        info!("Starting proxy");
         let mut join_set = JoinSet::new();
-        let address = self.get_listen_address(self.public_config.port);
+        let address = self.get_listen_address();
 
         #[cfg(with_metrics)]
-        Self::start_metrics(
-            self.get_listen_address(self.internal_config.metrics_port),
+        monitoring_server::start_metrics(
+            address,
             shutdown_signal.clone(),
+            _enable_memory_profiling.into(),
         );
 
         self.public_config
@@ -263,13 +321,24 @@ where
         Ok(())
     }
 
-    #[cfg(with_metrics)]
-    pub fn start_metrics(address: SocketAddr, shutdown_signal: CancellationToken) {
-        prometheus_server::start_metrics(address, shutdown_signal)
+    fn port(&self) -> u16 {
+        self.internal_config
+            .proxies
+            .get(self.id)
+            .unwrap_or_else(|| panic!("proxy with id {} must be present", self.id))
+            .public_port
     }
 
-    fn get_listen_address(&self, port: u16) -> SocketAddr {
-        SocketAddr::from(([0, 0, 0, 0], port))
+    fn metrics_port(&self) -> u16 {
+        self.internal_config
+            .proxies
+            .get(self.id)
+            .unwrap_or_else(|| panic!("proxy with id {} must be present", self.id))
+            .metrics_port
+    }
+
+    fn get_listen_address(&self) -> SocketAddr {
+        SocketAddr::from(([0, 0, 0, 0], self.port()))
     }
 
     async fn try_proxy_message(
@@ -297,9 +366,25 @@ where
                     linera_version::VersionInfo::default().into(),
                 )))
             }
-            GenesisConfigHashQuery => Ok(Some(RpcMessage::GenesisConfigHashResponse(Box::new(
-                self.genesis_config.hash(),
-            )))),
+            NetworkDescriptionQuery => {
+                let description = self
+                    .storage
+                    .read_network_description()
+                    .await?
+                    .ok_or_else(|| anyhow!("Cannot find network description in the database"))?;
+                Ok(Some(RpcMessage::NetworkDescriptionResponse(Box::new(
+                    description,
+                ))))
+            }
+            ShardInfoQuery(chain_id) => {
+                let shard_id = self.internal_config.get_shard_id(chain_id);
+                let total_shards = self.internal_config.shards.len();
+                let shard_info = linera_rpc::ShardInfo {
+                    shard_id,
+                    total_shards,
+                };
+                Ok(Some(RpcMessage::ShardInfoResponse(shard_info)))
+            }
             UploadBlob(content) => {
                 let blob = Blob::new(*content);
                 let id = blob.id();
@@ -310,24 +395,88 @@ where
                 Ok(Some(RpcMessage::UploadBlobResponse(Box::new(id))))
             }
             DownloadBlob(blob_id) => {
-                let content = self.storage.read_blob(*blob_id).await?.into_content();
+                let blob = self.storage.read_blob(*blob_id).await?;
+                let blob = blob.ok_or_else(|| anyhow!("Blob not found {}", blob_id))?;
+                let content = blob.into_content();
                 Ok(Some(RpcMessage::DownloadBlobResponse(Box::new(content))))
             }
             DownloadConfirmedBlock(hash) => {
+                let block = self.storage.read_confirmed_block(*hash).await?;
+                let block = block.ok_or_else(|| anyhow!("Missing confirmed block {hash}"))?;
                 Ok(Some(RpcMessage::DownloadConfirmedBlockResponse(Box::new(
-                    self.storage
-                        .read_hashed_confirmed_block(*hash)
-                        .await?
-                        .into_inner(),
+                    block,
                 ))))
             }
             DownloadCertificates(hashes) => {
-                let certificates = self.storage.read_certificates(hashes).await?;
+                let certificates = self.storage.read_certificates(hashes.clone()).await?;
+                let certificates = match ResultReadCertificates::new(certificates, hashes) {
+                    ResultReadCertificates::Certificates(certificates) => certificates,
+                    ResultReadCertificates::InvalidHashes(hashes) => {
+                        bail!("Missing certificates: {hashes:?}")
+                    }
+                };
                 Ok(Some(RpcMessage::DownloadCertificatesResponse(certificates)))
             }
-            BlobLastUsedBy(blob_id) => Ok(Some(RpcMessage::BlobLastUsedByResponse(Box::new(
-                self.storage.read_blob_state(*blob_id).await?.last_used_by,
-            )))),
+            DownloadCertificatesByHeights(chain_id, heights) => {
+                let shard = self.internal_config.get_shard_for(chain_id).clone();
+                let protocol = self.internal_config.protocol;
+
+                let chain_info_query = RpcMessage::ChainInfoQuery(Box::new(
+                    linera_core::data_types::ChainInfoQuery::new(chain_id)
+                        .with_sent_certificate_hashes_by_heights(heights),
+                ));
+
+                let hashes = match Self::try_proxy_message(
+                    chain_info_query,
+                    shard.clone(),
+                    protocol,
+                    self.send_timeout,
+                    self.recv_timeout,
+                )
+                .await
+                {
+                    Ok(Some(RpcMessage::ChainInfoResponse(response))) => {
+                        response.info.requested_sent_certificate_hashes
+                    }
+                    _ => bail!("Failed to retrieve sent certificate hashes"),
+                };
+                let certificates = self.storage.read_certificates(hashes.clone()).await?;
+                let certificates = match ResultReadCertificates::new(certificates, hashes) {
+                    ResultReadCertificates::Certificates(certificates) => certificates,
+                    ResultReadCertificates::InvalidHashes(hashes) => {
+                        bail!("Missing certificates: {hashes:?}")
+                    }
+                };
+
+                Ok(Some(RpcMessage::DownloadCertificatesByHeightsResponse(
+                    certificates,
+                )))
+            }
+            BlobLastUsedBy(blob_id) => {
+                let blob_state = self.storage.read_blob_state(*blob_id).await?;
+                let blob_state = blob_state.ok_or_else(|| anyhow!("Blob not found {}", blob_id))?;
+                let last_used_by = blob_state
+                    .last_used_by
+                    .ok_or_else(|| anyhow!("Blob not found {}", blob_id))?;
+                Ok(Some(RpcMessage::BlobLastUsedByResponse(Box::new(
+                    last_used_by,
+                ))))
+            }
+            BlobLastUsedByCertificate(blob_id) => {
+                let blob_state = self.storage.read_blob_state(*blob_id).await?;
+                let blob_state = blob_state.ok_or_else(|| anyhow!("Blob not found {}", blob_id))?;
+                let last_used_by = blob_state
+                    .last_used_by
+                    .ok_or_else(|| anyhow!("Blob not found {}", blob_id))?;
+                let certificate = self
+                    .storage
+                    .read_certificate(last_used_by)
+                    .await?
+                    .ok_or_else(|| anyhow!("Certificate not found {}", last_used_by))?;
+                Ok(Some(RpcMessage::BlobLastUsedByCertificateResponse(
+                    Box::new(certificate),
+                )))
+            }
             MissingBlobIds(blob_ids) => Ok(Some(RpcMessage::MissingBlobIdsResponse(
                 self.storage.missing_blobs(&blob_ids).await?,
             ))),
@@ -342,27 +491,27 @@ where
             | Error(_)
             | ChainInfoResponse(_)
             | VersionInfoResponse(_)
-            | GenesisConfigHashResponse(_)
+            | NetworkDescriptionResponse(_)
+            | ShardInfoResponse(_)
             | DownloadBlobResponse(_)
             | DownloadPendingBlob(_)
             | DownloadPendingBlobResponse(_)
             | HandlePendingBlob(_)
             | BlobLastUsedByResponse(_)
+            | BlobLastUsedByCertificateResponse(_)
             | MissingBlobIdsResponse(_)
             | DownloadConfirmedBlockResponse(_)
             | DownloadCertificatesResponse(_)
-            | UploadBlobResponse(_) => Err(anyhow::Error::from(NodeError::UnexpectedMessage)),
+            | UploadBlobResponse(_)
+            | DownloadCertificatesByHeightsResponse(_) => {
+                Err(anyhow::Error::from(NodeError::UnexpectedMessage))
+            }
         }
     }
 }
 
 fn main() -> Result<()> {
     let options = <ProxyOptions as clap::Parser>::parse();
-    let server_config: ValidatorServerConfig =
-        util::read_json(&options.config_path).expect("Fail to read server config");
-    let name = &server_config.validator.name;
-
-    linera_base::tracing::init(&format!("validator-{name}-proxy"));
 
     let mut runtime = if options.tokio_threads == Some(1) {
         tokio::runtime::Builder::new_current_thread()
@@ -376,25 +525,35 @@ fn main() -> Result<()> {
         builder
     };
 
+    if let Some(blocking_threads) = options.tokio_blocking_threads {
+        runtime.max_blocking_threads(blocking_threads);
+    }
+
     runtime.enable_all().build()?.block_on(options.run())
 }
 
 impl ProxyOptions {
     async fn run(&self) -> Result<()> {
-        let common_config = CommonStoreConfig {
-            max_concurrent_queries: self.max_concurrent_queries,
-            max_stream_queries: self.max_stream_queries,
-            cache_size: self.cache_size,
-        };
-        let full_storage_config = self.storage_config.add_common_config(common_config).await?;
-        let genesis_config: GenesisConfig = util::read_json(&self.genesis_config_path)?;
-        run_with_storage(
-            full_storage_config,
-            &genesis_config,
-            None,
-            ProxyContext::from_options(self)?,
-        )
-        .boxed()
-        .await?
+        let server_config: ValidatorServerConfig =
+            util::read_json(&self.config_path).expect("Fail to read server config");
+        let public_key = &server_config.validator.public_key;
+        linera_service::tracing::opentelemetry::init(
+            &format!("validator-{public_key}-proxy"),
+            self.otlp_exporter_endpoint.as_deref(),
+        );
+
+        let store_config = self
+            .storage_config
+            .add_common_storage_options(&self.common_storage_options)?;
+        // Proxies are part of validator infrastructure and should not output contract logs.
+        let allow_application_logs = false;
+        store_config
+            .run_with_storage(
+                None,
+                allow_application_logs,
+                ProxyContext::from_options(self)?,
+            )
+            .boxed()
+            .await?
     }
 }

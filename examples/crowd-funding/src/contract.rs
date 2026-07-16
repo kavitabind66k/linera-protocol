@@ -6,9 +6,10 @@
 mod state;
 
 use crowd_funding::{CrowdFundingAbi, InstantiationArgument, Message, Operation};
-use fungible::{Account, FungibleTokenAbi};
+use fungible::FungibleTokenAbi;
 use linera_sdk::{
-    base::{AccountOwner, Amount, ApplicationId, WithContractAbi},
+    abis::fungible::FungibleOperation,
+    linera_base_types::{Account, AccountOwner, Amount, ApplicationId, WithContractAbi},
     views::{RootView, View},
     Contract, ContractRuntime,
 };
@@ -29,6 +30,7 @@ impl Contract for CrowdFundingContract {
     type Message = Message;
     type InstantiationArgument = InstantiationArgument;
     type Parameters = ApplicationId<fungible::FungibleTokenAbi>;
+    type EventValue = ();
 
     async fn load(runtime: ContractRuntime<Self>) -> Self {
         let state = CrowdFundingState::load(runtime.root_view_storage_context())
@@ -99,7 +101,7 @@ impl CrowdFundingContract {
         // TODO(#589): Simplify this when the messaging system guarantees atomic delivery
         // of all messages created in the same operation/message.
         let target_account = Account { chain_id, owner };
-        let call = fungible::Operation::Transfer {
+        let call = FungibleOperation::Transfer {
             owner,
             amount,
             target_account,
@@ -192,13 +194,11 @@ impl CrowdFundingContract {
 
     /// Queries the token application to determine the total amount of tokens in custody.
     fn balance(&mut self) -> Amount {
-        let owner = AccountOwner::Application(self.runtime.application_id().forget_abi());
+        let owner = self.runtime.application_id().into();
         let fungible_id = self.fungible_id();
-        let response = self.runtime.call_application(
-            true,
-            fungible_id,
-            &fungible::Operation::Balance { owner },
-        );
+        let response =
+            self.runtime
+                .call_application(true, fungible_id, &FungibleOperation::Balance { owner });
         match response {
             fungible::FungibleResponse::Balance(balance) => balance,
             response => panic!("Unexpected response from fungible token application: {response:?}"),
@@ -211,8 +211,8 @@ impl CrowdFundingContract {
             chain_id: self.runtime.chain_id(),
             owner,
         };
-        let transfer = fungible::Operation::Transfer {
-            owner: AccountOwner::Application(self.runtime.application_id().forget_abi()),
+        let transfer = FungibleOperation::Transfer {
+            owner: self.runtime.application_id().into(),
             amount,
             target_account,
         };
@@ -224,9 +224,9 @@ impl CrowdFundingContract {
     fn receive_from_account(&mut self, owner: AccountOwner, amount: Amount) {
         let target_account = Account {
             chain_id: self.runtime.chain_id(),
-            owner: AccountOwner::Application(self.runtime.application_id().forget_abi()),
+            owner: self.runtime.application_id().into(),
         };
-        let transfer = fungible::Operation::Transfer {
+        let transfer = FungibleOperation::Transfer {
             owner,
             amount,
             target_account,

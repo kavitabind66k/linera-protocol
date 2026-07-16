@@ -4,8 +4,9 @@
 #[cfg(with_testing)]
 use std::sync::LazyLock;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     env,
+    num::NonZeroU16,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -19,26 +20,34 @@ use linera_base::{
     command::{resolve_binary, CommandExt},
     data_types::Amount,
 };
-use linera_client::storage::{StorageConfig, StorageConfigNamespace};
-use linera_execution::ResourceControlPolicy;
+use linera_client::client_options::ResourceControlPolicyConfig;
+use linera_core::node::ValidatorNodeProvider;
+use linera_rpc::config::{CrossChainConfig, ExporterServiceConfig, TlsConfig};
 #[cfg(all(feature = "storage-service", with_testing))]
 use linera_storage_service::common::storage_service_test_endpoint;
+#[cfg(all(feature = "rocksdb", feature = "scylladb", with_testing))]
+use linera_views::rocks_db::{RocksDbDatabase, RocksDbSpawnMode};
 #[cfg(all(feature = "scylladb", with_testing))]
-use linera_views::{scylla_db::ScyllaDbStore, store::TestKeyValueStore as _};
+use linera_views::{scylla_db::ScyllaDbDatabase, store::TestKeyValueDatabase as _};
 use tempfile::{tempdir, TempDir};
 use tokio::process::{Child, Command};
 use tonic::transport::{channel::ClientTlsConfig, Endpoint};
 use tonic_health::pb::{
     health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     cli_wrappers::{
         ClientWrapper, LineraNet, LineraNetConfig, Network, NetworkConfig, OnClientDrop,
     },
+    config::{BlockExporterConfig, Destination, DestinationConfig},
+    storage::{InnerStorageConfig, StorageConfig},
     util::ChildExt,
 };
+
+/// Maximum allowed number of shards over all validators.
+const MAX_NUMBER_SHARDS: usize = 1000;
 
 pub enum ProcessInbox {
     Skip,
@@ -48,7 +57,15 @@ pub enum ProcessInbox {
 #[cfg(with_testing)]
 static PORT_PROVIDER: LazyLock<RwLock<u16>> = LazyLock::new(|| RwLock::new(7080));
 
-/// Provides a port for the node_service. Increment the port numbers.
+/// The offset of the port
+fn test_offset_port() -> usize {
+    std::env::var("TEST_OFFSET_PORT")
+        .ok()
+        .and_then(|port_str| port_str.parse::<usize>().ok())
+        .unwrap_or(9000)
+}
+
+/// Provides a port for the node service. Increment the port numbers.
 #[cfg(with_testing)]
 pub async fn get_node_port() -> u16 {
     let mut port = PORT_PROVIDER.write().await;
@@ -60,14 +77,14 @@ pub async fn get_node_port() -> u16 {
 }
 
 #[cfg(with_testing)]
-async fn make_testing_config(database: Database) -> Result<StorageConfig> {
+async fn make_testing_config(database: Database) -> Result<InnerStorageConfig> {
     match database {
         Database::Service => {
             #[cfg(feature = "storage-service")]
             {
                 let endpoint = storage_service_test_endpoint()
                     .expect("Reading LINERA_STORAGE_SERVICE environment variable");
-                Ok(StorageConfig::Service { endpoint })
+                Ok(InnerStorageConfig::Service { endpoint })
             }
             #[cfg(not(feature = "storage-service"))]
             panic!("Database::Service is selected without the feature storage_service");
@@ -75,41 +92,56 @@ async fn make_testing_config(database: Database) -> Result<StorageConfig> {
         Database::DynamoDb => {
             #[cfg(feature = "dynamodb")]
             {
-                let use_localstack = true;
-                Ok(StorageConfig::DynamoDb { use_localstack })
+                let use_dynamodb_local = true;
+                Ok(InnerStorageConfig::DynamoDb { use_dynamodb_local })
             }
             #[cfg(not(feature = "dynamodb"))]
-            panic!("Database::DynamoDb is selected without the feature aws");
+            panic!("Database::DynamoDb is selected without the feature dynamodb");
         }
         Database::ScyllaDb => {
             #[cfg(feature = "scylladb")]
             {
-                let config = ScyllaDbStore::new_test_config().await?;
-                Ok(StorageConfig::ScyllaDb {
+                let config = ScyllaDbDatabase::new_test_config().await?;
+                Ok(InnerStorageConfig::ScyllaDb {
                     uri: config.inner_config.uri,
                 })
             }
             #[cfg(not(feature = "scylladb"))]
-            panic!("Database::ScyllaDb is selected without the feature sctlladb");
+            panic!("Database::ScyllaDb is selected without the feature scylladb");
+        }
+        Database::DualRocksDbScyllaDb => {
+            #[cfg(all(feature = "rocksdb", feature = "scylladb"))]
+            {
+                let rocksdb_config = RocksDbDatabase::new_test_config().await?;
+                let scylla_config = ScyllaDbDatabase::new_test_config().await?;
+                let spawn_mode = RocksDbSpawnMode::get_spawn_mode_from_runtime();
+                Ok(InnerStorageConfig::DualRocksDbScyllaDb {
+                    path_with_guard: rocksdb_config.inner_config.path_with_guard,
+                    spawn_mode,
+                    uri: scylla_config.inner_config.uri,
+                })
+            }
+            #[cfg(not(all(feature = "rocksdb", feature = "scylladb")))]
+            panic!("Database::DualRocksDbScyllaDb is selected without the features rocksdb and scylladb");
         }
     }
 }
 
-pub enum StorageConfigBuilder {
+pub enum InnerStorageConfigBuilder {
     #[cfg(with_testing)]
     TestConfig,
     ExistingConfig {
-        storage_config: StorageConfig,
+        storage_config: InnerStorageConfig,
     },
 }
 
-impl StorageConfigBuilder {
-    #[allow(unused_variables)]
-    pub async fn build(self, database: Database) -> Result<StorageConfig> {
+impl InnerStorageConfigBuilder {
+    #[cfg_attr(not(with_testing), expect(unused_variables))]
+    pub async fn build(self, database: Database) -> Result<InnerStorageConfig> {
         match self {
             #[cfg(with_testing)]
-            StorageConfigBuilder::TestConfig => make_testing_config(database).await,
-            StorageConfigBuilder::ExistingConfig { storage_config } => Ok(storage_config),
+            InnerStorageConfigBuilder::TestConfig => make_testing_config(database).await,
+            InnerStorageConfigBuilder::ExistingConfig { storage_config } => Ok(storage_config),
         }
     }
 }
@@ -135,7 +167,7 @@ impl PathProvider {
         Ok(PathProvider::TemporaryDirectory { tmp_dir })
     }
 
-    pub fn new(path: &Option<String>) -> anyhow::Result<Self> {
+    pub fn from_path_option(path: &Option<String>) -> anyhow::Result<Self> {
         Ok(match path {
             None => {
                 let tmp_dir = Arc::new(tempfile::tempdir()?);
@@ -160,9 +192,37 @@ pub struct LocalNetConfig {
     pub initial_amount: Amount,
     pub num_initial_validators: usize,
     pub num_shards: usize,
-    pub policy: ResourceControlPolicy,
-    pub storage_config_builder: StorageConfigBuilder,
+    pub num_proxies: usize,
+    pub policy_config: ResourceControlPolicyConfig,
+    pub cross_chain_config: CrossChainConfig,
+    pub storage_config_builder: InnerStorageConfigBuilder,
     pub path_provider: PathProvider,
+    pub block_exporters: ExportersSetup,
+}
+
+/// The setup for the block exporters.
+#[derive(Clone, PartialEq)]
+pub enum ExportersSetup {
+    // Block exporters are meant to be started and managed by the testing framework.
+    Local(Vec<BlockExporterConfig>),
+    // Block exporters are already started and we just need to connect to them.
+    Remote(Vec<ExporterServiceConfig>),
+}
+
+impl ExportersSetup {
+    pub fn new(
+        with_block_exporter: bool,
+        block_exporter_address: String,
+        block_exporter_port: NonZeroU16,
+    ) -> ExportersSetup {
+        if with_block_exporter {
+            let exporter_config =
+                ExporterServiceConfig::new(block_exporter_address, block_exporter_port.into());
+            ExportersSetup::Remote(vec![exporter_config])
+        } else {
+            ExportersSetup::Local(vec![])
+        }
+    }
 }
 
 /// A set of Linera validators running locally as native processes.
@@ -171,13 +231,16 @@ pub struct LocalNet {
     testing_prng_seed: Option<u64>,
     next_client_id: usize,
     num_initial_validators: usize,
+    num_proxies: usize,
     num_shards: usize,
-    validator_names: BTreeMap<usize, String>,
+    validator_keys: BTreeMap<usize, (String, String)>,
     running_validators: BTreeMap<usize, Validator>,
-    namespace: String,
-    validators_with_initialized_storage: HashSet<usize>,
-    storage_config: StorageConfig,
+    initialized_validator_storages: BTreeMap<usize, StorageConfig>,
+    common_namespace: String,
+    common_storage_config: InnerStorageConfig,
+    cross_chain_config: CrossChainConfig,
     path_provider: PathProvider,
+    block_exporters: ExportersSetup,
 }
 
 /// The name of the environment variable that allows specifying additional arguments to be passed
@@ -190,27 +253,29 @@ pub enum Database {
     Service,
     DynamoDb,
     ScyllaDb,
+    DualRocksDbScyllaDb,
 }
 
 /// The processes of a running validator.
 struct Validator {
-    proxy: Child,
+    proxies: Vec<Child>,
     servers: Vec<Child>,
+    exporters: Vec<Child>,
 }
 
 impl Validator {
-    fn new(proxy: Child) -> Self {
+    fn new() -> Self {
         Self {
-            proxy,
+            proxies: vec![],
             servers: vec![],
+            exporters: vec![],
         }
     }
 
     async fn terminate(&mut self) -> Result<()> {
-        self.proxy
-            .kill()
-            .await
-            .context("terminating validator proxy")?;
+        for proxy in &mut self.proxies {
+            proxy.kill().await.context("terminating validator proxy")?;
+        }
         for server in &mut self.servers {
             server
                 .kill()
@@ -218,6 +283,10 @@ impl Validator {
                 .context("terminating validator server")?;
         }
         Ok(())
+    }
+
+    fn add_proxy(&mut self, proxy: Child) {
+        self.proxies.push(proxy)
     }
 
     fn add_server(&mut self, server: Child) {
@@ -234,10 +303,19 @@ impl Validator {
         Ok(())
     }
 
+    fn add_block_exporter(&mut self, exporter: Child) {
+        self.exporters.push(exporter);
+    }
+
     fn ensure_is_running(&mut self) -> Result<()> {
-        self.proxy.ensure_is_running()?;
+        for proxy in &mut self.proxies {
+            proxy.ensure_is_running()?;
+        }
         for child in &mut self.servers {
             child.ensure_is_running()?;
+        }
+        for exporter in &mut self.exporters {
+            exporter.ensure_is_running()?;
         }
         Ok(())
     }
@@ -247,23 +325,28 @@ impl Validator {
 impl LocalNetConfig {
     pub fn new_test(database: Database, network: Network) -> Self {
         let num_shards = 4;
-        let storage_config_builder = StorageConfigBuilder::TestConfig;
+        let num_proxies = 1;
+        let storage_config_builder = InnerStorageConfigBuilder::TestConfig;
         let path_provider = PathProvider::create_temporary_directory().unwrap();
         let internal = network.drop_tls();
         let external = network;
         let network = NetworkConfig { internal, external };
+        let cross_chain_config = CrossChainConfig::default();
         Self {
             database,
             network,
             num_other_initial_chains: 2,
             initial_amount: Amount::from_tokens(1_000_000),
-            policy: ResourceControlPolicy::devnet(),
+            policy_config: ResourceControlPolicyConfig::Testnet,
+            cross_chain_config,
             testing_prng_seed: Some(37),
             namespace: linera_views::random::generate_test_namespace(),
             num_initial_validators: 4,
             num_shards,
+            num_proxies,
             storage_config_builder,
             path_provider,
+            block_exporters: ExportersSetup::Local(vec![]),
         }
     }
 }
@@ -273,36 +356,42 @@ impl LineraNetConfig for LocalNetConfig {
     type Net = LocalNet;
 
     async fn instantiate(self) -> Result<(Self::Net, ClientWrapper)> {
-        let server_config = self.storage_config_builder.build(self.database).await?;
+        let storage_config = self.storage_config_builder.build(self.database).await?;
         let mut net = LocalNet::new(
             self.network,
             self.testing_prng_seed,
             self.namespace,
             self.num_initial_validators,
+            self.num_proxies,
             self.num_shards,
-            server_config,
+            storage_config,
+            self.cross_chain_config,
             self.path_provider,
-        )?;
+            self.block_exporters,
+        );
         let client = net.make_client().await;
         ensure!(
             self.num_initial_validators > 0,
             "There should be at least one initial validator"
         );
-        net.generate_initial_validator_config().await.unwrap();
+        let total_number_shards = self.num_initial_validators * self.num_shards;
+        ensure!(
+            total_number_shards <= MAX_NUMBER_SHARDS,
+            "Total number of shards ({}) exceeds maximum allowed ({})",
+            self.num_shards,
+            MAX_NUMBER_SHARDS
+        );
+        net.generate_initial_validator_config().await?;
         client
             .create_genesis_config(
                 self.num_other_initial_chains,
                 self.initial_amount,
-                self.policy,
+                self.policy_config,
+                Some(vec!["localhost".to_owned()]),
             )
-            .await
-            .unwrap();
-        net.run().await.unwrap();
+            .await?;
+        net.run().await?;
         Ok((net, client))
-    }
-
-    async fn policy(&self) -> ResourceControlPolicy {
-        self.policy.clone()
     }
 }
 
@@ -339,29 +428,35 @@ impl LineraNet for LocalNet {
 }
 
 impl LocalNet {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new(
         network: NetworkConfig,
         testing_prng_seed: Option<u64>,
-        namespace: String,
+        common_namespace: String,
         num_initial_validators: usize,
+        num_proxies: usize,
         num_shards: usize,
-        storage_config: StorageConfig,
+        common_storage_config: InnerStorageConfig,
+        cross_chain_config: CrossChainConfig,
         path_provider: PathProvider,
-    ) -> Result<Self> {
-        Ok(Self {
+        block_exporters: ExportersSetup,
+    ) -> Self {
+        Self {
             network,
             testing_prng_seed,
             next_client_id: 0,
             num_initial_validators,
+            num_proxies,
             num_shards,
-            validator_names: BTreeMap::new(),
+            validator_keys: BTreeMap::new(),
             running_validators: BTreeMap::new(),
-            namespace,
-            validators_with_initialized_storage: HashSet::new(),
-            storage_config,
+            initialized_validator_storages: BTreeMap::new(),
+            common_namespace,
+            common_storage_config,
+            cross_chain_config,
             path_provider,
-        })
+            block_exporters,
+        }
     }
 
     async fn command_for_binary(&self, name: &'static str) -> Result<Command> {
@@ -377,24 +472,36 @@ impl LocalNet {
         crate::util::read_json(path.join("genesis.json"))
     }
 
-    pub fn proxy_port(validator: usize) -> usize {
-        9000 + validator * 100
+    fn shard_port(&self, validator: usize, shard: usize) -> usize {
+        test_offset_port() + validator * self.num_shards + shard + 1
     }
 
-    fn shard_port(validator: usize, shard: usize) -> usize {
-        9000 + validator * 100 + shard + 1
+    fn proxy_internal_port(&self, validator: usize, proxy_id: usize) -> usize {
+        test_offset_port() + 1000 + validator * self.num_proxies + proxy_id + 1
     }
 
-    fn internal_port(validator: usize) -> usize {
-        10000 + validator * 100
+    fn shard_metrics_port(&self, validator: usize, shard: usize) -> usize {
+        test_offset_port() + 2000 + validator * self.num_shards + shard + 1
     }
 
-    fn proxy_metrics_port(validator: usize) -> usize {
-        11000 + validator * 100
+    fn proxy_metrics_port(&self, validator: usize, proxy_id: usize) -> usize {
+        test_offset_port() + 3000 + validator * self.num_proxies + proxy_id + 1
     }
 
-    fn shard_metrics_port(validator: usize, shard: usize) -> usize {
-        11000 + validator * 100 + shard + 1
+    fn block_exporter_port(&self, validator: usize, exporter_id: usize) -> usize {
+        test_offset_port() + 3000 + validator * self.num_shards + exporter_id + 1
+    }
+
+    pub fn proxy_public_port(&self, validator: usize, proxy_id: usize) -> usize {
+        test_offset_port() + 4000 + validator * self.num_proxies + proxy_id + 1
+    }
+
+    pub fn first_public_port() -> usize {
+        test_offset_port() + 4000 + 1
+    }
+
+    fn block_exporter_metrics_port(exporter_id: usize) -> usize {
+        test_offset_port() + 4000 + exporter_id + 1
     }
 
     fn configuration_string(&self, server_number: usize) -> Result<String> {
@@ -403,9 +510,7 @@ impl LocalNet {
             .path_provider
             .path()
             .join(format!("validator_{n}.toml"));
-        let port = Self::proxy_port(n);
-        let internal_port = Self::internal_port(n);
-        let metrics_port = Self::proxy_metrics_port(n);
+        let port = self.proxy_public_port(n, 0);
         let external_protocol = self.network.external.toml();
         let internal_protocol = self.network.internal.toml();
         let external_host = self.network.external.localhost();
@@ -415,28 +520,89 @@ impl LocalNet {
                 server_config_path = "server_{n}.json"
                 host = "{external_host}"
                 port = {port}
-                internal_host = "{internal_host}"
-                internal_port = {internal_port}
-                metrics_host = "{external_host}"
-                metrics_port = {metrics_port}
                 external_protocol = {external_protocol}
                 internal_protocol = {internal_protocol}
             "#
         );
+
+        for k in 0..self.num_proxies {
+            let public_port = self.proxy_public_port(n, k);
+            let internal_port = self.proxy_internal_port(n, k);
+            let metrics_port = self.proxy_metrics_port(n, k);
+            // In the local network, the validator ingress is
+            // the proxy - so the `public_port` is the validator
+            // port.
+            content.push_str(&format!(
+                r#"
+                [[proxies]]
+                host = "{internal_host}"
+                public_port = {public_port}
+                private_port = {internal_port}
+                metrics_port = {metrics_port}
+                "#
+            ));
+        }
+
         for k in 0..self.num_shards {
-            let shard_port = Self::shard_port(n, k);
-            let shard_metrics_port = Self::shard_metrics_port(n, k);
+            let shard_port = self.shard_port(n, k);
+            let shard_metrics_port = self.shard_metrics_port(n, k);
             content.push_str(&format!(
                 r#"
 
                 [[shards]]
                 host = "{internal_host}"
                 port = {shard_port}
-                metrics_host = "{external_host}"
                 metrics_port = {shard_metrics_port}
                 "#
             ));
         }
+
+        match self.block_exporters {
+            ExportersSetup::Local(ref exporters) => {
+                for (j, exporter) in exporters.iter().enumerate() {
+                    let host = Network::Grpc.localhost();
+                    let port = self.block_exporter_port(n, j);
+                    let config_content = format!(
+                        r#"
+
+                        [[block_exporters]]
+                        host = "{host}"
+                        port = {port}
+                        "#
+                    );
+
+                    content.push_str(&config_content);
+                    let exporter_config = self.generate_block_exporter_config(
+                        n,
+                        j as u32,
+                        &exporter.destination_config,
+                    );
+                    let config_path = self
+                        .path_provider
+                        .path()
+                        .join(format!("exporter_config_{n}:{j}.toml"));
+
+                    fs_err::write(&config_path, &exporter_config)?;
+                }
+            }
+            ExportersSetup::Remote(ref exporters) => {
+                for exporter in exporters {
+                    let host = exporter.host.clone();
+                    let port = exporter.port;
+                    let config_content = format!(
+                        r#"
+
+                        [[block_exporters]]
+                        host = "{host}"
+                        port = {port}
+                        "#
+                    );
+
+                    content.push_str(&config_content);
+                }
+            }
+        }
+
         fs_err::write(&path, content)?;
         path.into_os_string().into_string().map_err(|error| {
             anyhow!(
@@ -444,6 +610,93 @@ impl LocalNet {
                 error.to_string_lossy()
             )
         })
+    }
+
+    fn generate_block_exporter_config(
+        &self,
+        validator: usize,
+        exporter_id: u32,
+        destination_config: &DestinationConfig,
+    ) -> String {
+        let n = validator;
+        let host = Network::Grpc.localhost();
+        let port = self.block_exporter_port(n, exporter_id as usize);
+        let metrics_port = Self::block_exporter_metrics_port(exporter_id as usize);
+        let mut config = format!(
+            r#"
+            id = {exporter_id}
+
+            metrics_port = {metrics_port}
+
+            [service_config]
+            host = "{host}"
+            port = {port}
+
+            "#
+        );
+
+        let DestinationConfig {
+            destinations,
+            committee_destination,
+        } = destination_config;
+
+        if *committee_destination {
+            let destination_string_to_push = r#"
+
+            [destination_config]
+            committee_destination = true
+            "#
+            .to_string();
+
+            config.push_str(&destination_string_to_push);
+        }
+
+        for destination in destinations {
+            let destination_string_to_push = match destination {
+                Destination::Indexer {
+                    tls,
+                    endpoint,
+                    port,
+                } => {
+                    let tls = match tls {
+                        TlsConfig::ClearText => "ClearText",
+                        TlsConfig::Tls => "Tls",
+                    };
+                    format!(
+                        r#"
+                        [[destination_config.destinations]]
+                        tls = "{tls}"
+                        endpoint = "{endpoint}"
+                        port = {port}
+                        kind = "Indexer"
+                        "#
+                    )
+                }
+                Destination::Validator { endpoint, port } => {
+                    format!(
+                        r#"
+                        [[destination_config.destinations]]
+                        endpoint = "{endpoint}"
+                        port = {port}
+                        kind = "Validator"
+                        "#
+                    )
+                }
+                Destination::Logging { file_name } => {
+                    format!(
+                        r#"
+                        [[destination_config.destinations]]
+                        file_name = "{file_name}"
+                        kind = "Logging"
+                        "#
+                    )
+                }
+            };
+
+            config.push_str(&destination_string_to_push);
+        }
+
+        config
     }
 
     async fn generate_initial_validator_config(&mut self) -> Result<()> {
@@ -461,44 +714,93 @@ impl LocalNet {
             .args(["--committee", "committee.json"])
             .spawn_and_wait_for_stdout()
             .await?;
-        self.validator_names = output
+        self.validator_keys = output
             .split_whitespace()
             .map(str::to_string)
+            .map(|keys| keys.split(',').map(str::to_string).collect::<Vec<_>>())
             .enumerate()
+            .map(|(i, keys)| {
+                let validator_key = keys[0].to_string();
+                let account_key = keys[1].to_string();
+                (i, (validator_key, account_key))
+            })
             .collect();
         Ok(())
     }
 
-    async fn run_proxy(&mut self, validator: usize) -> Result<Child> {
-        let storage = self.initialize_storage(validator).await?;
+    async fn run_proxy(&mut self, validator: usize, proxy_id: usize) -> Result<Child> {
+        let storage = self
+            .initialized_validator_storages
+            .get(&validator)
+            .expect("initialized storage");
         let child = self
             .command_for_binary("linera-proxy")
             .await?
             .arg(format!("server_{}.json", validator))
-            .args(["--storage", &storage])
-            .args(["--genesis", "genesis.json"])
+            .args(["--storage", &storage.to_string()])
+            .args(["--id", &proxy_id.to_string()])
             .spawn_into()?;
 
+        let port = self.proxy_public_port(validator, proxy_id);
+        let nickname = format!("validator proxy {validator}");
         match self.network.external {
             Network::Grpc => {
-                let port = Self::proxy_port(validator);
+                Self::ensure_grpc_server_has_started(&nickname, port, "http").await?;
                 let nickname = format!("validator proxy {validator}");
                 Self::ensure_grpc_server_has_started(&nickname, port, "http").await?;
             }
             Network::Grpcs => {
-                let port = Self::proxy_port(validator);
                 let nickname = format!("validator proxy {validator}");
                 Self::ensure_grpc_server_has_started(&nickname, port, "https").await?;
             }
-            Network::Tcp | Network::Udp => {
-                info!("Letting validator proxy {validator} start");
-                linera_base::time::timer::sleep(Duration::from_secs(2)).await;
+            Network::Tcp => {
+                Self::ensure_simple_server_has_started(&nickname, port, "tcp").await?;
+            }
+            Network::Udp => {
+                Self::ensure_simple_server_has_started(&nickname, port, "udp").await?;
             }
         }
         Ok(child)
     }
 
-    async fn ensure_grpc_server_has_started(
+    async fn run_exporter(&mut self, validator: usize, exporter_id: u32) -> Result<Child> {
+        let config_path = format!("exporter_config_{validator}:{exporter_id}.toml");
+        let storage = self
+            .initialized_validator_storages
+            .get(&validator)
+            .expect("initialized storage");
+
+        tracing::debug!(config=?config_path, storage=?storage.to_string(), "starting block exporter");
+
+        let child = self
+            .command_for_binary("linera-exporter")
+            .await?
+            .args(["--config-path", &config_path])
+            .args(["--storage", &storage.to_string()])
+            .spawn_into()?;
+
+        match self.network.internal {
+            Network::Grpc => {
+                let port = self.block_exporter_port(validator, exporter_id as usize);
+                let nickname = format!("block exporter {validator}:{exporter_id}");
+                Self::ensure_grpc_server_has_started(&nickname, port, "http").await?;
+            }
+            Network::Grpcs => {
+                let port = self.block_exporter_port(validator, exporter_id as usize);
+                let nickname = format!("block exporter  {validator}:{exporter_id}");
+                Self::ensure_grpc_server_has_started(&nickname, port, "https").await?;
+            }
+            Network::Tcp | Network::Udp => {
+                unreachable!("Only allowed options are grpc and grpcs")
+            }
+        }
+
+        tracing::info!("block exporter started {validator}:{exporter_id}");
+
+        Ok(child)
+    }
+
+    pub async fn ensure_grpc_server_has_started(
         nickname: &str,
         port: usize,
         scheme: &str,
@@ -523,6 +825,38 @@ impl LocalNet {
             linera_base::time::timer::sleep(Duration::from_millis(i * 500)).await;
             let result = client.check(HealthCheckRequest::default()).await;
             if result.is_ok() && result.unwrap().get_ref().status() == ServingStatus::Serving {
+                info!(?port, "Successfully started {nickname}");
+                return Ok(());
+            } else {
+                warn!("Waiting for {nickname} to start");
+            }
+        }
+        bail!("Failed to start {nickname}");
+    }
+
+    async fn ensure_simple_server_has_started(
+        nickname: &str,
+        port: usize,
+        protocol: &str,
+    ) -> Result<()> {
+        use linera_core::node::ValidatorNode as _;
+
+        let options = linera_rpc::NodeOptions {
+            send_timeout: Duration::from_secs(5),
+            recv_timeout: Duration::from_secs(5),
+            retry_delay: Duration::from_secs(1),
+            max_retries: 1,
+        };
+        let provider = linera_rpc::simple::SimpleNodeProvider::new(options);
+        let address = format!("{protocol}:127.0.0.1:{port}");
+        // All "simple" services (i.e. proxy and "server") are based on `RpcMessage` and
+        // support `VersionInfoQuery`.
+        let node = provider.make_node(&address)?;
+        linera_base::time::timer::sleep(Duration::from_millis(100)).await;
+        for i in 0..10 {
+            linera_base::time::timer::sleep(Duration::from_millis(i * 500)).await;
+            let result = node.get_version_info().await;
+            if result.is_ok() {
                 info!("Successfully started {nickname}");
                 return Ok(());
             } else {
@@ -532,79 +866,66 @@ impl LocalNet {
         bail!("Failed to start {nickname}");
     }
 
-    async fn initialize_storage(&mut self, validator: usize) -> Result<String> {
-        let namespace = format!("{}_server_{}_db", self.namespace, validator);
-        let storage = StorageConfigNamespace {
-            storage_config: self.storage_config.clone(),
+    async fn initialize_storage(&mut self, validator: usize) -> Result<()> {
+        let namespace = format!("{}_server_{}_db", self.common_namespace, validator);
+        let inner_storage_config = self.common_storage_config.clone();
+        let storage = StorageConfig {
+            inner_storage_config,
             namespace,
+        };
+        let mut command = self.command_for_binary("linera").await?;
+        if let Ok(var) = env::var(SERVER_ENV) {
+            command.args(var.split_whitespace());
         }
-        .to_string();
+        command.args(["storage", "initialize"]);
+        command
+            .args(["--storage", &storage.to_string()])
+            .args(["--genesis", "genesis.json"])
+            .spawn_and_wait_for_stdout()
+            .await?;
 
-        if !self
-            .validators_with_initialized_storage
-            .contains(&validator)
-        {
-            let max_try = 4;
-            let mut i_try = 0;
-            loop {
-                let mut command = self.command_for_binary("linera-server").await?;
-                if let Ok(var) = env::var(SERVER_ENV) {
-                    command.args(var.split_whitespace());
-                }
-                command.arg("initialize");
-                let result = command
-                    .args(["--storage", &storage])
-                    .args(["--genesis", "genesis.json"])
-                    .spawn_and_wait_for_stdout()
-                    .await;
-                if result.is_ok() {
-                    break;
-                }
-                warn!(
-                    "Failed to initialize storage={} using linera-server, i_try={}, error={:?}",
-                    storage, i_try, result
-                );
-                i_try += 1;
-                if i_try == max_try {
-                    bail!("Failed to initialize after {} attempts", max_try);
-                }
-                let one_second = linera_base::time::Duration::from_secs(1);
-                std::thread::sleep(one_second);
-            }
-            self.validators_with_initialized_storage.insert(validator);
-        }
-
-        Ok(storage)
+        self.initialized_validator_storages
+            .insert(validator, storage);
+        Ok(())
     }
 
     async fn run_server(&mut self, validator: usize, shard: usize) -> Result<Child> {
-        let storage = self.initialize_storage(validator).await?;
+        let mut storage = self
+            .initialized_validator_storages
+            .get(&validator)
+            .expect("initialized storage")
+            .clone();
+
+        // For the storage backends with a local directory, make sure that we don't reuse
+        // the same directory for all the shards.
+        storage.maybe_append_shard_path(shard)?;
+
         let mut command = self.command_for_binary("linera-server").await?;
         if let Ok(var) = env::var(SERVER_ENV) {
             command.args(var.split_whitespace());
         }
-        command.arg("run");
-        let child = command
-            .args(["--storage", &storage])
+        command
+            .arg("run")
+            .args(["--storage", &storage.to_string()])
             .args(["--server", &format!("server_{}.json", validator)])
             .args(["--shard", &shard.to_string()])
-            .args(["--genesis", "genesis.json"])
-            .spawn_into()?;
+            .args(self.cross_chain_config.to_args());
+        let child = command.spawn_into()?;
 
+        let port = self.shard_port(validator, shard);
+        let nickname = format!("validator server {validator}:{shard}");
         match self.network.internal {
             Network::Grpc => {
-                let port = Self::shard_port(validator, shard);
-                let nickname = format!("validator server {validator}:{shard}");
                 Self::ensure_grpc_server_has_started(&nickname, port, "http").await?;
             }
             Network::Grpcs => {
-                let port = Self::shard_port(validator, shard);
-                let nickname = format!("validator server {validator}:{shard}");
                 Self::ensure_grpc_server_has_started(&nickname, port, "https").await?;
             }
-            Network::Tcp | Network::Udp => {
-                info!("Letting validator server {validator}:{shard} start");
-                linera_base::time::timer::sleep(Duration::from_secs(2)).await;
+            Network::Tcp => {
+                Self::ensure_simple_server_has_started(&nickname, port, "tcp").await?;
+            }
+            Network::Udp => {
+                Self::ensure_simple_server_has_started(&nickname, port, "udp").await?;
             }
         }
         Ok(child)
@@ -617,22 +938,73 @@ impl LocalNet {
         Ok(())
     }
 
-    pub async fn start_validator(&mut self, validator: usize) -> Result<()> {
-        let proxy = self.run_proxy(validator).await?;
-        let mut validator_proxy = Validator::new(proxy);
-        for shard in 0..self.num_shards {
-            let server = self.run_server(validator, shard).await?;
-            validator_proxy.add_server(server);
+    /// Start a validator.
+    pub async fn start_validator(&mut self, index: usize) -> Result<()> {
+        self.initialize_storage(index).await?;
+        self.restart_validator(index).await
+    }
+
+    /// Restart a validator. This is similar to `start_validator` except that the
+    /// database was already initialized once.
+    pub async fn restart_validator(&mut self, index: usize) -> Result<()> {
+        let mut validator = Validator::new();
+        for k in 0..self.num_proxies {
+            let proxy = self.run_proxy(index, k).await?;
+            validator.add_proxy(proxy);
         }
-        self.running_validators.insert(validator, validator_proxy);
+        for shard in 0..self.num_shards {
+            let server = self.run_server(index, shard).await?;
+            validator.add_server(server);
+        }
+        if let ExportersSetup::Local(ref exporters) = self.block_exporters {
+            for block_exporter in 0..exporters.len() {
+                let exporter = self.run_exporter(index, block_exporter as u32).await?;
+                validator.add_block_exporter(exporter);
+            }
+        }
+
+        self.running_validators.insert(index, validator);
         Ok(())
+    }
+
+    /// Terminates all the processes of a given validator.
+    pub async fn stop_validator(&mut self, index: usize) -> Result<()> {
+        if let Some(mut validator) = self.running_validators.remove(&index) {
+            if let Err(error) = validator.terminate().await {
+                error!("Failed to stop validator {index}: {error}");
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns a [`linera_rpc::Client`] to interact directly with a `validator`.
+    pub fn validator_client(&mut self, validator: usize) -> Result<linera_rpc::Client> {
+        let node_provider = linera_rpc::NodeProvider::new(linera_rpc::NodeOptions {
+            send_timeout: Duration::from_secs(1),
+            recv_timeout: Duration::from_secs(1),
+            retry_delay: Duration::ZERO,
+            max_retries: 0,
+        });
+
+        Ok(node_provider.make_node(&self.validator_address(validator))?)
+    }
+
+    /// Returns the address to connect to a validator's proxy.
+    /// In local networks, the zeroth proxy _is_ the validator ingress.
+    pub fn validator_address(&self, validator: usize) -> String {
+        let port = self.proxy_public_port(validator, 0);
+        let schema = self.network.external.schema();
+
+        format!("{schema}:localhost:{port}")
     }
 }
 
 #[cfg(with_testing)]
 impl LocalNet {
-    pub fn validator_name(&self, validator: usize) -> Option<&String> {
-        self.validator_names.get(&validator)
+    /// Returns the validating key and an account key of the validator.
+    pub fn validator_keys(&self, validator: usize) -> Option<&(String, String)> {
+        self.validator_keys.get(&validator)
     }
 
     pub async fn generate_validator_config(&mut self, validator: usize) -> Result<()> {
@@ -644,8 +1016,13 @@ impl LocalNet {
             .arg(&self.configuration_string(validator)?)
             .spawn_and_wait_for_stdout()
             .await?;
-        self.validator_names
-            .insert(validator, stdout.trim().to_string());
+        let keys = stdout
+            .trim()
+            .split(',')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        self.validator_keys
+            .insert(validator, (keys[0].clone(), keys[1].clone()));
         Ok(())
     }
 
@@ -669,7 +1046,7 @@ impl LocalNet {
         let server = self.run_server(validator, shard).await?;
         self.running_validators
             .get_mut(&validator)
-            .context("could not find server")?
+            .context("could not find validator")?
             .add_server(server);
         Ok(())
     }

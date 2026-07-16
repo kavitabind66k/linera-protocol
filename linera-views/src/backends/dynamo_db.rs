@@ -3,14 +3,20 @@
 
 //! Implements [`crate::store::KeyValueStore`] for the DynamoDB database.
 
-use std::{collections::HashMap, env, sync::Arc};
+use std::{
+    collections::HashMap,
+    env,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use async_lock::{Semaphore, SemaphoreGuard};
-use async_trait::async_trait;
 use aws_sdk_dynamodb::{
     error::SdkError,
     operation::{
-        batch_write_item::BatchWriteItemError,
+        batch_get_item::BatchGetItemError,
         create_table::CreateTableError,
         delete_table::DeleteTableError,
         get_item::GetItemError,
@@ -20,58 +26,53 @@ use aws_sdk_dynamodb::{
     },
     primitives::Blob,
     types::{
-        AttributeDefinition, AttributeValue, Delete, KeySchemaElement, KeyType,
+        AttributeDefinition, AttributeValue, Delete, KeySchemaElement, KeyType, KeysAndAttributes,
         ProvisionedThroughput, Put, ScalarAttributeType, TransactWriteItem,
     },
     Client,
 };
 use aws_smithy_types::error::operation::BuildError;
-use futures::future::{join_all, FutureExt as _};
-use linera_base::ensure;
+use futures::future::join_all;
+use linera_base::{ensure, util::future::FutureSyncExt as _};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[cfg(with_metrics)]
-use crate::metering::MeteredStore;
+use crate::metering::MeteredDatabase;
 #[cfg(with_testing)]
-use crate::store::TestKeyValueStore;
+use crate::store::TestKeyValueDatabase;
 use crate::{
     batch::SimpleUnorderedBatch,
     common::get_uleb128_size,
-    journaling::{DirectWritableKeyValueStore, JournalConsistencyError, JournalingKeyValueStore},
-    lru_caching::{LruCachingConfig, LruCachingStore},
+    journaling::{JournalConsistencyError, JournalingKeyValueDatabase},
+    lru_caching::{LruCachingConfig, LruCachingDatabase},
     store::{
-        AdminKeyValueStore, CommonStoreInternalConfig, KeyIterable, KeyValueIterable,
-        KeyValueStoreError, ReadableKeyValueStore, WithError,
+        DirectWritableKeyValueStore, KeyValueDatabase, KeyValueStoreError, ReadableKeyValueStore,
+        WithError,
     },
-    value_splitting::{ValueSplittingError, ValueSplittingStore},
+    value_splitting::{ValueSplittingDatabase, ValueSplittingError},
 };
 
-/// Name of the environment variable with the address to a LocalStack instance.
-const LOCALSTACK_ENDPOINT: &str = "LOCALSTACK_ENDPOINT";
-
-/// The configuration to connect to DynamoDB.
-pub type Config = aws_sdk_dynamodb::Config;
+/// Name of the environment variable with the address to a DynamoDB local instance.
+const DYNAMODB_LOCAL_ENDPOINT: &str = "DYNAMODB_LOCAL_ENDPOINT";
 
 /// Gets the AWS configuration from the environment
 async fn get_base_config() -> Result<aws_sdk_dynamodb::Config, DynamoDbStoreInternalError> {
     let base_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest())
-        .boxed()
+        .boxed_sync()
         .await;
     Ok((&base_config).into())
 }
 
 fn get_endpoint_address() -> Option<String> {
-    let endpoint_address = env::var(LOCALSTACK_ENDPOINT);
-    match endpoint_address {
-        Err(_) => None,
-        Ok(address) => Some(address),
-    }
+    env::var(DYNAMODB_LOCAL_ENDPOINT).ok()
 }
 
-/// Gets the localstack config
-async fn get_localstack_config() -> Result<aws_sdk_dynamodb::Config, DynamoDbStoreInternalError> {
+/// Gets the DynamoDB local config
+async fn get_dynamodb_local_config() -> Result<aws_sdk_dynamodb::Config, DynamoDbStoreInternalError>
+{
     let base_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest())
-        .boxed()
+        .boxed_sync()
         .await;
     let endpoint_address = get_endpoint_address().unwrap();
     let config = aws_sdk_dynamodb::config::Builder::from(&base_config)
@@ -80,22 +81,17 @@ async fn get_localstack_config() -> Result<aws_sdk_dynamodb::Config, DynamoDbSto
     Ok(config)
 }
 
-/// Getting a configuration for the system
-async fn get_config_internal(
-    use_localstack: bool,
-) -> Result<aws_sdk_dynamodb::Config, DynamoDbStoreInternalError> {
-    if use_localstack {
-        get_localstack_config().await
-    } else {
-        get_base_config().await
-    }
-}
+/// DynamoDB forbids the iteration over the partition keys.
+/// Therefore we use a special partition key named `[1]` for storing
+/// the root keys. For normal root keys, we simply put a `[0]` in
+/// front therefore no intersection is possible.
+const PARTITION_KEY_ROOT_KEY: &[u8] = &[1];
 
 /// The attribute name of the partition key.
 const PARTITION_ATTRIBUTE: &str = "item_partition";
 
 /// A root key being used for testing existence of tables
-const EMPTY_ROOT_KEY: &[u8] = &[];
+const EMPTY_ROOT_KEY: &[u8] = &[0];
 
 /// A key being used for testing existence of tables
 const DB_KEY: &[u8] = &[0];
@@ -109,20 +105,20 @@ const VALUE_ATTRIBUTE: &str = "item_value";
 /// The attribute for obtaining the primary key (used as a sort key) with the stored value.
 const KEY_VALUE_ATTRIBUTE: &str = "item_key, item_value";
 
-/// TODO(#1084): The scheme below with the MAX_VALUE_SIZE has to be checked
-/// This is the maximum size of a raw value in DynamoDb.
+/// TODO(#1084): The scheme below with the `MAX_VALUE_SIZE` has to be checked
+/// This is the maximum size of a raw value in DynamoDB.
 const RAW_MAX_VALUE_SIZE: usize = 409600;
 
-/// Fundamental constants in DynamoDB: The maximum size of a value is 400KB
+/// Fundamental constants in DynamoDB: The maximum size of a value is 400 KB
 /// See https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ServiceQuotas.html
-/// However, the value being written can also be the serialization of a SimpleUnorderedBatch
-/// Therefore the actual MAX_VALUE_SIZE might be lower.
-/// At the maximum the key_size is 1024 bytes (see below) and we pack just one entry.
+/// However, the value being written can also be the serialization of a `SimpleUnorderedBatch`
+/// Therefore the actual `MAX_VALUE_SIZE` might be lower.
+/// At the maximum key size is 1024 bytes (see below) and we pack just one entry.
 /// So if the key has 1024 bytes this gets us the inequality
 /// `1 + 1 + serialized_size(1024)? + serialized_size(x)? <= 400*1024`
 /// and so this simplifies to `1 + 1 + (2 + 1024) + (3 + x) <= 400 * 1024`
 /// Note on the following formula:
-/// * We write 3 because get_uleb128_size(400*1024) = 3
+/// * We write 3 because `get_uleb128_size(400*1024) == 3`
 /// * We write `1 + 1` because the `SimpleUnorderedBatch` has two entries
 ///
 /// This gets us a maximal value of 408569;
@@ -133,16 +129,17 @@ const VISIBLE_MAX_VALUE_SIZE: usize = RAW_MAX_VALUE_SIZE
     - 1
     - 1;
 
-/// Fundamental constant in DynamoDB: The maximum size of a key is 1024 bytes
+/// Fundamental constant in DynamoDB: The maximum size of a key is 1024 bytes.
+/// We decrease by 1 because we append a [1] as prefix.
 /// See https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.NamingRulesDataTypes.html
-const MAX_KEY_SIZE: usize = 1024;
+const MAX_KEY_SIZE: usize = 1023;
 
-/// Fundamental constants in DynamoDB: The maximum size of a TransactWriteItem is 4M.
+/// Fundamental constants in DynamoDB: The maximum size of a [`TransactWriteItem`] is 4 MB.
 /// See https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html
 /// We're taking a conservative value because the mode of computation is unclear.
 const MAX_TRANSACT_WRITE_ITEM_TOTAL_SIZE: usize = 4000000;
 
-/// The DynamoDb database is potentially handling an infinite number of connections.
+/// The DynamoDB database is potentially handling an infinite number of connections.
 /// However, for testing or some other purpose we really need to decrease the number of
 /// connections.
 #[cfg(with_testing)]
@@ -152,50 +149,56 @@ const TEST_DYNAMO_DB_MAX_CONCURRENT_QUERIES: usize = 10;
 #[cfg(with_testing)]
 const TEST_DYNAMO_DB_MAX_STREAM_QUERIES: usize = 10;
 
-/// Fundamental constants in DynamoDB: The maximum size of a TransactWriteItem is 100.
+/// Fundamental constants in DynamoDB: The maximum size of a [`TransactWriteItem`] is 100.
 /// See <https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html>
 const MAX_TRANSACT_WRITE_ITEM_SIZE: usize = 100;
 
-/// Keys of length 0 are not allowed, so we extend by having a prefix on start
-fn extend_root_key(root_key: &[u8]) -> Vec<u8> {
-    let mut vec = vec![0];
-    vec.extend(root_key);
-    vec
-}
+/// Maximum number of entries that can be obtained in a [`BatchGetItem`] operation.
+/// The two constraints are at most 100 operations and at most 16M in total.
+/// Since the maximum size of a value is 400K, this gets us 40 as upper limit
+const MAX_BATCH_GET_ITEM_SIZE: usize = 40;
 
 /// Builds the key attributes for a table item.
 ///
 /// The key is composed of two attributes that are both binary blobs. The first attribute is a
 /// partition key and is currently just a dummy value that ensures all items are in the same
-/// partion. This is necessary for range queries to work correctly.
+/// partition. This is necessary for range queries to work correctly.
 ///
 /// The second attribute is the actual key value, which is generated by concatenating the
-/// context prefix. The Vec<u8> expression is obtained from self.derive_key.
-fn build_key(root_key: &[u8], key: Vec<u8>) -> HashMap<String, AttributeValue> {
-    let big_root = extend_root_key(root_key);
+/// context prefix. `The Vec<u8>` expression is obtained from `self.derive_key`.
+fn build_key(start_key: &[u8], key: Vec<u8>) -> HashMap<String, AttributeValue> {
+    let mut prefixed_key = vec![1];
+    prefixed_key.extend(key);
     [
         (
             PARTITION_ATTRIBUTE.to_owned(),
-            AttributeValue::B(Blob::new(big_root)),
+            AttributeValue::B(Blob::new(start_key.to_vec())),
         ),
-        (KEY_ATTRIBUTE.to_owned(), AttributeValue::B(Blob::new(key))),
+        (
+            KEY_ATTRIBUTE.to_owned(),
+            AttributeValue::B(Blob::new(prefixed_key)),
+        ),
     ]
     .into()
 }
 
 /// Builds the value attribute for storing a table item.
 fn build_key_value(
-    root_key: &[u8],
+    start_key: &[u8],
     key: Vec<u8>,
     value: Vec<u8>,
 ) -> HashMap<String, AttributeValue> {
-    let big_root = extend_root_key(root_key);
+    let mut prefixed_key = vec![1];
+    prefixed_key.extend(key);
     [
         (
             PARTITION_ATTRIBUTE.to_owned(),
-            AttributeValue::B(Blob::new(big_root)),
+            AttributeValue::B(Blob::new(start_key.to_vec())),
         ),
-        (KEY_ATTRIBUTE.to_owned(), AttributeValue::B(Blob::new(key))),
+        (
+            KEY_ATTRIBUTE.to_owned(),
+            AttributeValue::B(Blob::new(prefixed_key)),
+        ),
         (
             VALUE_ATTRIBUTE.to_owned(),
             AttributeValue::B(Blob::new(value)),
@@ -206,7 +209,6 @@ fn build_key_value(
 
 /// Checks that a key is of the correct size
 fn check_key_size(key: &[u8]) -> Result<(), DynamoDbStoreInternalError> {
-    ensure!(!key.is_empty(), DynamoDbStoreInternalError::ZeroLengthKey);
     ensure!(
         key.len() <= MAX_KEY_SIZE,
         DynamoDbStoreInternalError::KeyTooLong
@@ -223,7 +225,7 @@ fn extract_key(
         .get(KEY_ATTRIBUTE)
         .ok_or(DynamoDbStoreInternalError::MissingKey)?;
     match key {
-        AttributeValue::B(blob) => Ok(&blob.as_ref()[prefix_len..]),
+        AttributeValue::B(blob) => Ok(&blob.as_ref()[1 + prefix_len..]),
         key => Err(DynamoDbStoreInternalError::wrong_key_type(key)),
     }
 }
@@ -266,28 +268,16 @@ fn extract_key_value(
     Ok((key, value))
 }
 
-/// Extracts the `(key, value)` pair attributes from an item (returned by value).
-fn extract_key_value_owned(
-    prefix_len: usize,
-    attributes: &mut HashMap<String, AttributeValue>,
-) -> Result<(Vec<u8>, Vec<u8>), DynamoDbStoreInternalError> {
-    let key = extract_key(prefix_len, attributes)?.to_vec();
-    let value = extract_value_owned(attributes)?;
-    Ok((key, value))
-}
-
 struct TransactionBuilder {
-    root_key: Vec<u8>,
-    transacts: Vec<TransactWriteItem>,
+    start_key: Vec<u8>,
+    transactions: Vec<TransactWriteItem>,
 }
 
 impl TransactionBuilder {
-    fn new(root_key: &[u8]) -> Self {
-        let root_key = root_key.to_vec();
-        let transacts = Vec::new();
+    fn new(start_key: &[u8]) -> Self {
         Self {
-            root_key,
-            transacts,
+            start_key: start_key.to_vec(),
+            transactions: Vec::new(),
         }
     }
 
@@ -296,8 +286,8 @@ impl TransactionBuilder {
         key: Vec<u8>,
         store: &DynamoDbStoreInternal,
     ) -> Result<(), DynamoDbStoreInternalError> {
-        let transact = store.build_delete_transact(&self.root_key, key)?;
-        self.transacts.push(transact);
+        let transaction = store.build_delete_transaction(&self.start_key, key)?;
+        self.transactions.push(transaction);
         Ok(())
     }
 
@@ -307,8 +297,8 @@ impl TransactionBuilder {
         value: Vec<u8>,
         store: &DynamoDbStoreInternal,
     ) -> Result<(), DynamoDbStoreInternalError> {
-        let transact = store.build_put_transact(&self.root_key, key, value)?;
-        self.transacts.push(transact);
+        let transaction = store.build_put_transaction(&self.start_key, key, value)?;
+        self.transactions.push(transaction);
         Ok(())
     }
 }
@@ -320,20 +310,48 @@ pub struct DynamoDbStoreInternal {
     namespace: String,
     semaphore: Option<Arc<Semaphore>>,
     max_stream_queries: usize,
-    root_key: Vec<u8>,
+    start_key: Vec<u8>,
+    root_key_written: Arc<AtomicBool>,
 }
 
-/// The initial configuration of the system
-#[derive(Debug)]
+/// Database-level connection to DynamoDB for managing namespaces and partitions.
+#[derive(Clone)]
+pub struct DynamoDbDatabaseInternal {
+    client: Client,
+    namespace: String,
+    semaphore: Option<Arc<Semaphore>>,
+    max_stream_queries: usize,
+}
+
+impl WithError for DynamoDbDatabaseInternal {
+    type Error = DynamoDbStoreInternalError;
+}
+
+/// The initial configuration of the system.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamoDbStoreInternalConfig {
-    /// The AWS configuration
-    config: aws_sdk_dynamodb::Config,
-    /// The common configuration of the key value store
-    common_config: CommonStoreInternalConfig,
+    /// Whether to use DynamoDB local or not.
+    pub use_dynamodb_local: bool,
+    /// Maximum number of concurrent database queries allowed for this client.
+    pub max_concurrent_queries: Option<usize>,
+    /// Preferred buffer size for async streams.
+    pub max_stream_queries: usize,
 }
 
-impl AdminKeyValueStore for DynamoDbStoreInternal {
+impl DynamoDbStoreInternalConfig {
+    async fn client(&self) -> Result<Client, DynamoDbStoreInternalError> {
+        let config = if self.use_dynamodb_local {
+            get_dynamodb_local_config().await?
+        } else {
+            get_base_config().await?
+        };
+        Ok(Client::from_conf(config))
+    }
+}
+
+impl KeyValueDatabase for DynamoDbDatabaseInternal {
     type Config = DynamoDbStoreInternalConfig;
+    type Store = DynamoDbStoreInternal;
 
     fn get_name() -> String {
         "dynamodb internal".to_string()
@@ -342,43 +360,35 @@ impl AdminKeyValueStore for DynamoDbStoreInternal {
     async fn connect(
         config: &Self::Config,
         namespace: &str,
-        root_key: &[u8],
     ) -> Result<Self, DynamoDbStoreInternalError> {
         Self::check_namespace(namespace)?;
-        let client = Client::from_conf(config.config.clone());
+        let client = config.client().await?;
         let semaphore = config
-            .common_config
             .max_concurrent_queries
             .map(|n| Arc::new(Semaphore::new(n)));
-        let max_stream_queries = config.common_config.max_stream_queries;
+        let max_stream_queries = config.max_stream_queries;
         let namespace = namespace.to_string();
-        let root_key = root_key.to_vec();
-        Ok(Self {
+        let store = Self {
             client,
             namespace,
             semaphore,
             max_stream_queries,
-            root_key,
-        })
+        };
+        Ok(store)
     }
 
-    fn clone_with_root_key(&self, root_key: &[u8]) -> Result<Self, DynamoDbStoreInternalError> {
-        let client = self.client.clone();
-        let namespace = self.namespace.clone();
-        let semaphore = self.semaphore.clone();
-        let max_stream_queries = self.max_stream_queries;
-        let root_key = root_key.to_vec();
-        Ok(Self {
-            client,
-            namespace,
-            semaphore,
-            max_stream_queries,
-            root_key,
-        })
+    fn open_shared(&self, root_key: &[u8]) -> Result<Self::Store, DynamoDbStoreInternalError> {
+        let mut start_key = EMPTY_ROOT_KEY.to_vec();
+        start_key.extend(root_key);
+        Ok(self.open_internal(start_key))
+    }
+
+    fn open_exclusive(&self, root_key: &[u8]) -> Result<Self::Store, DynamoDbStoreInternalError> {
+        self.open_shared(root_key)
     }
 
     async fn list_all(config: &Self::Config) -> Result<Vec<String>, DynamoDbStoreInternalError> {
-        let client = Client::from_conf(config.config.clone());
+        let client = config.client().await?;
         let mut namespaces = Vec::new();
         let mut start_table = None;
         loop {
@@ -386,7 +396,7 @@ impl AdminKeyValueStore for DynamoDbStoreInternal {
                 .list_tables()
                 .set_exclusive_start_table_name(start_table)
                 .send()
-                .boxed()
+                .boxed_sync()
                 .await?;
             if let Some(namespaces_blk) = response.table_names {
                 namespaces.extend(namespaces_blk);
@@ -400,15 +410,20 @@ impl AdminKeyValueStore for DynamoDbStoreInternal {
         Ok(namespaces)
     }
 
+    async fn list_root_keys(&self) -> Result<Vec<Vec<u8>>, DynamoDbStoreInternalError> {
+        let store = self.open_internal(PARTITION_KEY_ROOT_KEY.to_vec());
+        store.find_keys_by_prefix(EMPTY_ROOT_KEY).await
+    }
+
     async fn delete_all(config: &Self::Config) -> Result<(), DynamoDbStoreInternalError> {
-        let client = Client::from_conf(config.config.clone());
+        let client = config.client().await?;
         let tables = Self::list_all(config).await?;
         for table in tables {
             client
                 .delete_table()
                 .table_name(&table)
                 .send()
-                .boxed()
+                .boxed_sync()
                 .await?;
         }
         Ok(())
@@ -419,14 +434,14 @@ impl AdminKeyValueStore for DynamoDbStoreInternal {
         namespace: &str,
     ) -> Result<bool, DynamoDbStoreInternalError> {
         Self::check_namespace(namespace)?;
-        let client = Client::from_conf(config.config.clone());
+        let client = config.client().await?;
         let key_db = build_key(EMPTY_ROOT_KEY, DB_KEY.to_vec());
         let response = client
             .get_item()
             .table_name(namespace)
             .set_key(Some(key_db))
             .send()
-            .boxed()
+            .boxed_sync()
             .await;
         let Err(error) = response else {
             return Ok(true);
@@ -453,8 +468,8 @@ impl AdminKeyValueStore for DynamoDbStoreInternal {
         namespace: &str,
     ) -> Result<(), DynamoDbStoreInternalError> {
         Self::check_namespace(namespace)?;
-        let client = Client::from_conf(config.config.clone());
-        let _result = client
+        let client = config.client().await?;
+        client
             .create_table()
             .table_name(namespace)
             .attribute_definitions(
@@ -488,7 +503,7 @@ impl AdminKeyValueStore for DynamoDbStoreInternal {
                     .build()?,
             )
             .send()
-            .boxed()
+            .boxed_sync()
             .await?;
         Ok(())
     }
@@ -498,19 +513,19 @@ impl AdminKeyValueStore for DynamoDbStoreInternal {
         namespace: &str,
     ) -> Result<(), DynamoDbStoreInternalError> {
         Self::check_namespace(namespace)?;
-        let client = Client::from_conf(config.config.clone());
+        let client = config.client().await?;
         client
             .delete_table()
             .table_name(namespace)
             .send()
-            .boxed()
+            .boxed_sync()
             .await?;
         Ok(())
     }
 }
 
-impl DynamoDbStoreInternal {
-    /// Namespaces are named table names in DynamoDb [naming
+impl DynamoDbDatabaseInternal {
+    /// Namespaces are named table names in DynamoDB [naming
     /// rules](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.NamingRulesDataTypes.html#HowItWorks.NamingRules),
     /// so we need to check correctness of the namespace
     fn check_namespace(namespace: &str) -> Result<(), InvalidNamespace> {
@@ -531,22 +546,39 @@ impl DynamoDbStoreInternal {
         Ok(())
     }
 
-    fn build_delete_transact(
+    fn open_internal(&self, start_key: Vec<u8>) -> DynamoDbStoreInternal {
+        let client = self.client.clone();
+        let namespace = self.namespace.clone();
+        let semaphore = self.semaphore.clone();
+        let max_stream_queries = self.max_stream_queries;
+        DynamoDbStoreInternal {
+            client,
+            namespace,
+            semaphore,
+            max_stream_queries,
+            start_key,
+            root_key_written: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl DynamoDbStoreInternal {
+    fn build_delete_transaction(
         &self,
-        root_key: &[u8],
+        start_key: &[u8],
         key: Vec<u8>,
     ) -> Result<TransactWriteItem, DynamoDbStoreInternalError> {
         check_key_size(&key)?;
         let request = Delete::builder()
             .table_name(&self.namespace)
-            .set_key(Some(build_key(root_key, key)))
+            .set_key(Some(build_key(start_key, key)))
             .build()?;
         Ok(TransactWriteItem::builder().delete(request).build())
     }
 
-    fn build_put_transact(
+    fn build_put_transaction(
         &self,
-        root_key: &[u8],
+        start_key: &[u8],
         key: Vec<u8>,
         value: Vec<u8>,
     ) -> Result<TransactWriteItem, DynamoDbStoreInternalError> {
@@ -557,7 +589,7 @@ impl DynamoDbStoreInternal {
         );
         let request = Put::builder()
             .table_name(&self.namespace)
-            .set_item(Some(build_key_value(root_key, key, value)))
+            .set_item(Some(build_key_value(start_key, key, value)))
             .build()?;
         Ok(TransactWriteItem::builder().put(request).build())
     }
@@ -573,12 +605,14 @@ impl DynamoDbStoreInternal {
     async fn get_query_output(
         &self,
         attribute_str: &str,
-        root_key: &[u8],
+        start_key: &[u8],
         key_prefix: &[u8],
         start_key_map: Option<HashMap<String, AttributeValue>>,
     ) -> Result<QueryOutput, DynamoDbStoreInternalError> {
         let _guard = self.acquire().await;
-        let big_root = extend_root_key(root_key);
+        let start_key = start_key.to_vec();
+        let mut prefixed_key_prefix = vec![1];
+        prefixed_key_prefix.extend(key_prefix);
         let response = self
             .client
             .query()
@@ -587,11 +621,14 @@ impl DynamoDbStoreInternal {
             .key_condition_expression(format!(
                 "{PARTITION_ATTRIBUTE} = :partition and begins_with({KEY_ATTRIBUTE}, :prefix)"
             ))
-            .expression_attribute_values(":partition", AttributeValue::B(Blob::new(big_root)))
-            .expression_attribute_values(":prefix", AttributeValue::B(Blob::new(key_prefix)))
+            .expression_attribute_values(":partition", AttributeValue::B(Blob::new(start_key)))
+            .expression_attribute_values(
+                ":prefix",
+                AttributeValue::B(Blob::new(prefixed_key_prefix)),
+            )
             .set_exclusive_start_key(start_key_map)
             .send()
-            .boxed()
+            .boxed_sync()
             .await?;
         Ok(response)
     }
@@ -607,7 +644,7 @@ impl DynamoDbStoreInternal {
             .table_name(&self.namespace)
             .set_key(Some(key_db))
             .send()
-            .boxed()
+            .boxed_sync()
             .await?;
 
         match response.item {
@@ -631,7 +668,7 @@ impl DynamoDbStoreInternal {
             .set_key(Some(key_db))
             .projection_expression(PARTITION_ATTRIBUTE)
             .send()
-            .boxed()
+            .boxed_sync()
             .await?;
 
         Ok(response.item.is_some())
@@ -640,15 +677,15 @@ impl DynamoDbStoreInternal {
     async fn get_list_responses(
         &self,
         attribute: &str,
-        root_key: &[u8],
+        start_key: &[u8],
         key_prefix: &[u8],
     ) -> Result<QueryResponses, DynamoDbStoreInternalError> {
         check_key_size(key_prefix)?;
         let mut responses = Vec::new();
-        let mut start_key = None;
+        let mut start_key_map = None;
         loop {
             let response = self
-                .get_query_output(attribute, root_key, key_prefix, start_key)
+                .get_query_output(attribute, start_key, key_prefix, start_key_map)
                 .await?;
             let last_evaluated = response.last_evaluated_key.clone();
             responses.push(response);
@@ -657,7 +694,7 @@ impl DynamoDbStoreInternal {
                     break;
                 }
                 Some(value) => {
-                    start_key = Some(value);
+                    start_key_map = Some(value);
                 }
             }
         }
@@ -666,6 +703,85 @@ impl DynamoDbStoreInternal {
             responses,
         })
     }
+
+    async fn read_batch_values_bytes(
+        &self,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>, DynamoDbStoreInternalError> {
+        // Early return for empty keys
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut results = vec![None; keys.len()];
+
+        // Build the request keys
+        let mut request_keys = Vec::new();
+        let mut key_to_index = HashMap::<Vec<u8>, Vec<usize>>::new();
+
+        for (i, key) in keys.iter().enumerate() {
+            check_key_size(key)?;
+            let key_attrs = build_key(&self.start_key, key.clone());
+            key_to_index.entry(key.clone()).or_default().push(i);
+            request_keys.push(key_attrs);
+        }
+
+        let keys_and_attributes = KeysAndAttributes::builder()
+            .set_keys(Some(request_keys))
+            .build()?;
+
+        let mut request_items = HashMap::new();
+        request_items.insert(self.namespace.clone(), keys_and_attributes);
+
+        // Execute batch get item request with retry for unprocessed keys
+        let mut remaining_request_items = Some(request_items);
+
+        while let Some(request_items) = remaining_request_items {
+            // Skip if the request items are empty
+            if request_items.is_empty() {
+                break;
+            }
+
+            let _guard = self.acquire().await;
+            let response = self
+                .client
+                .batch_get_item()
+                .set_request_items(Some(request_items))
+                .send()
+                .boxed_sync()
+                .await?;
+
+            // Process returned items
+            if let Some(mut responses) = response.responses {
+                if let Some(items) = responses.remove(&self.namespace) {
+                    for mut item in items {
+                        // Extract key to find the original index
+                        let key_attr = item
+                            .get(KEY_ATTRIBUTE)
+                            .ok_or(DynamoDbStoreInternalError::MissingKey)?;
+
+                        if let AttributeValue::B(blob) = key_attr {
+                            let prefixed_key = blob.as_ref();
+                            let key = &prefixed_key[1..]; // Remove the [1] prefix
+                            if let Some(indices) = key_to_index.get(key) {
+                                if let Some((&last, rest)) = indices.split_last() {
+                                    let value = extract_value_owned(&mut item)?;
+                                    for index in rest {
+                                        results[*index] = Some(value.clone());
+                                    }
+                                    results[last] = Some(value);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Handle unprocessed keys
+            remaining_request_items = response.unprocessed_keys;
+        }
+
+        Ok(results)
+    }
 }
 
 struct QueryResponses {
@@ -673,167 +789,21 @@ struct QueryResponses {
     responses: Vec<QueryOutput>,
 }
 
-// Inspired by https://depth-first.com/articles/2020/06/22/returning-rust-iterators/
-#[doc(hidden)]
-#[expect(clippy::type_complexity)]
-pub struct DynamoDbKeyBlockIterator<'a> {
-    prefix_len: usize,
-    pos: usize,
-    iters: Vec<
-        std::iter::Flatten<
-            std::option::Iter<'a, Vec<HashMap<std::string::String, AttributeValue>>>,
-        >,
-    >,
-}
-
-impl<'a> Iterator for DynamoDbKeyBlockIterator<'a> {
-    type Item = Result<&'a [u8], DynamoDbStoreInternalError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let result = self.iters[self.pos].next();
-        match result {
-            None => {
-                if self.pos == self.iters.len() - 1 {
-                    return None;
-                }
-                self.pos += 1;
-                self.iters[self.pos]
-                    .next()
-                    .map(|x| extract_key(self.prefix_len, x))
-            }
-            Some(result) => Some(extract_key(self.prefix_len, result)),
-        }
-    }
-}
-
-/// A set of keys returned by a search query on DynamoDB.
-pub struct DynamoDbKeys {
-    result_queries: QueryResponses,
-}
-
-impl KeyIterable<DynamoDbStoreInternalError> for DynamoDbKeys {
-    type Iterator<'a>
-        = DynamoDbKeyBlockIterator<'a>
-    where
-        Self: 'a;
-
-    fn iterator(&self) -> Self::Iterator<'_> {
-        let pos = 0;
-        let mut iters = Vec::new();
-        for response in &self.result_queries.responses {
-            let iter = response.items.iter().flatten();
-            iters.push(iter);
-        }
-        DynamoDbKeyBlockIterator {
-            prefix_len: self.result_queries.prefix_len,
-            pos,
-            iters,
-        }
-    }
-}
-
-/// A set of `(key, value)` returned by a search query on DynamoDb.
-pub struct DynamoDbKeyValues {
-    result_queries: QueryResponses,
-}
-
-#[doc(hidden)]
-#[expect(clippy::type_complexity)]
-pub struct DynamoDbKeyValueIterator<'a> {
-    prefix_len: usize,
-    pos: usize,
-    iters: Vec<
-        std::iter::Flatten<
-            std::option::Iter<'a, Vec<HashMap<std::string::String, AttributeValue>>>,
-        >,
-    >,
-}
-
-impl<'a> Iterator for DynamoDbKeyValueIterator<'a> {
-    type Item = Result<(&'a [u8], &'a [u8]), DynamoDbStoreInternalError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let result = self.iters[self.pos].next();
-        match result {
-            None => {
-                if self.pos == self.iters.len() - 1 {
-                    return None;
-                }
-                self.pos += 1;
-                self.iters[self.pos]
-                    .next()
-                    .map(|x| extract_key_value(self.prefix_len, x))
-            }
-            Some(result) => Some(extract_key_value(self.prefix_len, result)),
-        }
-    }
-}
-
-#[doc(hidden)]
-#[expect(clippy::type_complexity)]
-pub struct DynamoDbKeyValueIteratorOwned {
-    prefix_len: usize,
-    pos: usize,
-    iters: Vec<
-        std::iter::Flatten<
-            std::option::IntoIter<Vec<HashMap<std::string::String, AttributeValue>>>,
-        >,
-    >,
-}
-
-impl Iterator for DynamoDbKeyValueIteratorOwned {
-    type Item = Result<(Vec<u8>, Vec<u8>), DynamoDbStoreInternalError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let result = self.iters[self.pos].next();
-        match result {
-            None => {
-                if self.pos == self.iters.len() - 1 {
-                    return None;
-                }
-                self.pos += 1;
-                self.iters[self.pos]
-                    .next()
-                    .map(|mut x| extract_key_value_owned(self.prefix_len, &mut x))
-            }
-            Some(mut result) => Some(extract_key_value_owned(self.prefix_len, &mut result)),
-        }
-    }
-}
-
-impl KeyValueIterable<DynamoDbStoreInternalError> for DynamoDbKeyValues {
-    type Iterator<'a>
-        = DynamoDbKeyValueIterator<'a>
-    where
-        Self: 'a;
-    type IteratorOwned = DynamoDbKeyValueIteratorOwned;
-
-    fn iterator(&self) -> Self::Iterator<'_> {
-        let pos = 0;
-        let mut iters = Vec::new();
-        for response in &self.result_queries.responses {
-            let iter = response.items.iter().flatten();
-            iters.push(iter);
-        }
-        DynamoDbKeyValueIterator {
-            prefix_len: self.result_queries.prefix_len,
-            pos,
-            iters,
-        }
+impl QueryResponses {
+    fn keys(&self) -> impl Iterator<Item = Result<&[u8], DynamoDbStoreInternalError>> {
+        self.responses
+            .iter()
+            .flat_map(|response| response.items.iter().flatten())
+            .map(|item| extract_key(self.prefix_len, item))
     }
 
-    fn into_iterator_owned(self) -> Self::IteratorOwned {
-        let pos = 0;
-        let mut iters = Vec::new();
-        for response in self.result_queries.responses.into_iter() {
-            let iter = response.items.into_iter().flatten();
-            iters.push(iter);
-        }
-        DynamoDbKeyValueIteratorOwned {
-            prefix_len: self.result_queries.prefix_len,
-            pos,
-            iters,
-        }
+    fn key_values(
+        &self,
+    ) -> impl Iterator<Item = Result<(&[u8], &[u8]), DynamoDbStoreInternalError>> {
+        self.responses
+            .iter()
+            .flat_map(|response| response.items.iter().flatten())
+            .map(|item| extract_key_value(self.prefix_len, item))
     }
 }
 
@@ -843,11 +813,14 @@ impl WithError for DynamoDbStoreInternal {
 
 impl ReadableKeyValueStore for DynamoDbStoreInternal {
     const MAX_KEY_SIZE: usize = MAX_KEY_SIZE;
-    type Keys = DynamoDbKeys;
-    type KeyValues = DynamoDbKeyValues;
 
     fn max_stream_queries(&self) -> usize {
         self.max_stream_queries
+    }
+
+    fn root_key(&self) -> Result<Vec<u8>, DynamoDbStoreInternalError> {
+        assert!(self.start_key.starts_with(EMPTY_ROOT_KEY));
+        Ok(self.start_key[EMPTY_ROOT_KEY.len()..].to_vec())
     }
 
     async fn read_value_bytes(
@@ -855,24 +828,24 @@ impl ReadableKeyValueStore for DynamoDbStoreInternal {
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, DynamoDbStoreInternalError> {
         check_key_size(key)?;
-        let key_db = build_key(&self.root_key, key.to_vec());
+        let key_db = build_key(&self.start_key, key.to_vec());
         self.read_value_bytes_general(key_db).await
     }
 
     async fn contains_key(&self, key: &[u8]) -> Result<bool, DynamoDbStoreInternalError> {
         check_key_size(key)?;
-        let key_db = build_key(&self.root_key, key.to_vec());
+        let key_db = build_key(&self.start_key, key.to_vec());
         self.contains_key_general(key_db).await
     }
 
     async fn contains_keys(
         &self,
-        keys: Vec<Vec<u8>>,
+        keys: &[Vec<u8>],
     ) -> Result<Vec<bool>, DynamoDbStoreInternalError> {
         let mut handles = Vec::new();
         for key in keys {
-            check_key_size(&key)?;
-            let key_db = build_key(&self.root_key, key);
+            check_key_size(key)?;
+            let key_db = build_key(&self.start_key, key.clone());
             let handle = self.contains_key_general(key_db);
             handles.push(handle);
         }
@@ -884,43 +857,49 @@ impl ReadableKeyValueStore for DynamoDbStoreInternal {
 
     async fn read_multi_values_bytes(
         &self,
-        keys: Vec<Vec<u8>>,
+        keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, DynamoDbStoreInternalError> {
-        let mut handles = Vec::new();
-        for key in keys {
-            check_key_size(&key)?;
-            let key_db = build_key(&self.root_key, key);
-            let handle = self.read_value_bytes_general(key_db);
-            handles.push(handle);
+        if keys.is_empty() {
+            return Ok(Vec::new());
         }
-        join_all(handles)
+
+        let handles = keys
+            .chunks(MAX_BATCH_GET_ITEM_SIZE)
+            .map(|key_batch| self.read_batch_values_bytes(key_batch));
+        let results: Vec<_> = join_all(handles)
             .await
             .into_iter()
-            .collect::<Result<_, _>>()
+            .collect::<Result<_, _>>()?;
+        Ok(results.into_iter().flatten().collect())
     }
 
     async fn find_keys_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<DynamoDbKeys, DynamoDbStoreInternalError> {
+    ) -> Result<Vec<Vec<u8>>, DynamoDbStoreInternalError> {
         let result_queries = self
-            .get_list_responses(KEY_ATTRIBUTE, &self.root_key, key_prefix)
+            .get_list_responses(KEY_ATTRIBUTE, &self.start_key, key_prefix)
             .await?;
-        Ok(DynamoDbKeys { result_queries })
+        result_queries
+            .keys()
+            .map(|key| key.map(|k| k.to_vec()))
+            .collect()
     }
 
     async fn find_key_values_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<DynamoDbKeyValues, DynamoDbStoreInternalError> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DynamoDbStoreInternalError> {
         let result_queries = self
-            .get_list_responses(KEY_VALUE_ATTRIBUTE, &self.root_key, key_prefix)
+            .get_list_responses(KEY_VALUE_ATTRIBUTE, &self.start_key, key_prefix)
             .await?;
-        Ok(DynamoDbKeyValues { result_queries })
+        result_queries
+            .key_values()
+            .map(|entry| entry.map(|(key, value)| (key.to_vec(), value.to_vec())))
+            .collect()
     }
 }
 
-#[async_trait]
 impl DirectWritableKeyValueStore for DynamoDbStoreInternal {
     const MAX_BATCH_SIZE: usize = MAX_TRANSACT_WRITE_ITEM_SIZE;
     const MAX_BATCH_TOTAL_SIZE: usize = MAX_TRANSACT_WRITE_ITEM_TOTAL_SIZE;
@@ -930,20 +909,30 @@ impl DirectWritableKeyValueStore for DynamoDbStoreInternal {
     type Batch = SimpleUnorderedBatch;
 
     async fn write_batch(&self, batch: Self::Batch) -> Result<(), DynamoDbStoreInternalError> {
-        let mut builder = TransactionBuilder::new(&self.root_key);
+        if !self.root_key_written.fetch_or(true, Ordering::SeqCst) {
+            let mut builder = TransactionBuilder::new(PARTITION_KEY_ROOT_KEY);
+            builder.insert_put_request(self.start_key.clone(), vec![], self)?;
+            self.client
+                .transact_write_items()
+                .set_transact_items(Some(builder.transactions))
+                .send()
+                .boxed_sync()
+                .await?;
+        }
+        let mut builder = TransactionBuilder::new(&self.start_key);
         for key in batch.deletions {
             builder.insert_delete_request(key, self)?;
         }
         for (key, value) in batch.insertions {
             builder.insert_put_request(key, value, self)?;
         }
-        if !builder.transacts.is_empty() {
+        if !builder.transactions.is_empty() {
             let _guard = self.acquire().await;
             self.client
                 .transact_write_items()
-                .set_transact_items(Some(builder.transacts))
+                .set_transact_items(Some(builder.transactions))
                 .send()
-                .boxed()
+                .boxed_sync()
                 .await?;
         }
         Ok(())
@@ -973,9 +962,9 @@ pub enum DynamoDbStoreInternalError {
     #[error(transparent)]
     Get(#[from] Box<SdkError<GetItemError>>),
 
-    /// An error occurred while writing a batch of items.
+    /// An error occurred while batch getting items.
     #[error(transparent)]
-    BatchWriteItem(#[from] Box<SdkError<BatchWriteItemError>>),
+    BatchGet(#[from] Box<SdkError<BatchGetItemError>>),
 
     /// An error occurred while writing a transaction of items.
     #[error(transparent)]
@@ -993,13 +982,9 @@ pub enum DynamoDbStoreInternalError {
     #[error(transparent)]
     ListTables(#[from] Box<SdkError<ListTablesError>>),
 
-    /// The transact maximum size is MAX_TRANSACT_WRITE_ITEM_SIZE.
+    /// The transact maximum size is `MAX_TRANSACT_WRITE_ITEM_SIZE`.
     #[error("The transact must have length at most MAX_TRANSACT_WRITE_ITEM_SIZE")]
     TransactUpperLimitSize,
-
-    /// Keys have to be of non-zero length.
-    #[error("The key must be of strictly positive length")]
-    ZeroLengthKey,
 
     /// The key must have at most 1024 bytes
     #[error("The key must have at most 1024 bytes")]
@@ -1009,20 +994,12 @@ pub enum DynamoDbStoreInternalError {
     #[error("The key prefix must have at most 1024 bytes")]
     KeyPrefixTooLong,
 
-    /// Key prefixes have to be of non-zero length.
-    #[error("The key_prefix must be of strictly positive length")]
-    ZeroLengthKeyPrefix,
-
-    /// The recovery failed.
-    #[error("The DynamoDB database recovery failed")]
-    DatabaseRecoveryFailed,
-
     /// The journal is not coherent
     #[error(transparent)]
     JournalConsistencyError(#[from] JournalConsistencyError),
 
-    /// The length of the value should be at most 400KB.
-    #[error("The DynamoDB value should be less than 400KB")]
+    /// The length of the value should be at most 400 KB.
+    #[error("The DynamoDB value should be less than 400 KB")]
     ValueLengthTooLarge,
 
     /// The stored key is missing.
@@ -1051,7 +1028,7 @@ pub enum DynamoDbStoreInternalError {
 
     /// An error occurred while creating the table.
     #[error(transparent)]
-    CreateTable(#[from] SdkError<CreateTableError>),
+    CreateTable(#[from] Box<SdkError<CreateTableError>>),
 
     /// An error occurred while building an object
     #[error(transparent)]
@@ -1115,63 +1092,38 @@ impl KeyValueStoreError for DynamoDbStoreInternalError {
 }
 
 #[cfg(with_testing)]
-impl TestKeyValueStore for JournalingKeyValueStore<DynamoDbStoreInternal> {
+impl TestKeyValueDatabase for JournalingKeyValueDatabase<DynamoDbDatabaseInternal> {
     async fn new_test_config() -> Result<DynamoDbStoreInternalConfig, DynamoDbStoreInternalError> {
-        let common_config = CommonStoreInternalConfig {
+        Ok(DynamoDbStoreInternalConfig {
+            use_dynamodb_local: true,
             max_concurrent_queries: Some(TEST_DYNAMO_DB_MAX_CONCURRENT_QUERIES),
             max_stream_queries: TEST_DYNAMO_DB_MAX_STREAM_QUERIES,
-        };
-        let use_localstack = true;
-        let config = get_config_internal(use_localstack).await?;
-        Ok(DynamoDbStoreInternalConfig {
-            config,
-            common_config,
         })
     }
 }
 
-/// A shared DB client for DynamoDb implementing LruCaching and metrics
+/// The combined error type for [`DynamoDbDatabase`].
+pub type DynamoDbStoreError = ValueSplittingError<DynamoDbStoreInternalError>;
+
+/// The config type for [`DynamoDbDatabase`]`
+pub type DynamoDbStoreConfig = LruCachingConfig<DynamoDbStoreInternalConfig>;
+
+/// A shared DB client for DynamoDB with metrics
 #[cfg(with_metrics)]
-pub type DynamoDbStore = MeteredStore<
-    LruCachingStore<
-        MeteredStore<
-            ValueSplittingStore<MeteredStore<JournalingKeyValueStore<DynamoDbStoreInternal>>>,
+pub type DynamoDbDatabase = MeteredDatabase<
+    LruCachingDatabase<
+        MeteredDatabase<
+            ValueSplittingDatabase<
+                MeteredDatabase<JournalingKeyValueDatabase<DynamoDbDatabaseInternal>>,
+            >,
         >,
     >,
 >;
-
-/// A shared DB client for DynamoDb implementing LruCaching
+/// A shared DB client for DynamoDB
 #[cfg(not(with_metrics))]
-pub type DynamoDbStore =
-    LruCachingStore<ValueSplittingStore<JournalingKeyValueStore<DynamoDbStoreInternal>>>;
-
-/// The combined error type for the `DynamoDbStore`.
-pub type DynamoDbStoreError = ValueSplittingError<DynamoDbStoreInternalError>;
-
-/// The config type for DynamoDbStore
-pub type DynamoDbStoreConfig = LruCachingConfig<DynamoDbStoreInternalConfig>;
-
-/// Getting a configuration for the system
-pub async fn get_config(use_localstack: bool) -> Result<Config, DynamoDbStoreError> {
-    Ok(get_config_internal(use_localstack).await?)
-}
-
-impl DynamoDbStoreConfig {
-    /// Creates a `DynamoDbStoreConfig` from the input.
-    pub fn new(
-        config: Config,
-        common_config: crate::store::CommonStoreConfig,
-    ) -> DynamoDbStoreConfig {
-        let inner_config = DynamoDbStoreInternalConfig {
-            config,
-            common_config: common_config.reduced(),
-        };
-        DynamoDbStoreConfig {
-            inner_config,
-            cache_size: common_config.cache_size,
-        }
-    }
-}
+pub type DynamoDbDatabase = LruCachingDatabase<
+    ValueSplittingDatabase<JournalingKeyValueDatabase<DynamoDbDatabaseInternal>>,
+>;
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,7 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use allocative::Allocative;
 use async_graphql::SimpleObject;
 use linera_base::{
     data_types::{ArithmeticError, BlockHeight},
@@ -8,21 +9,48 @@ use linera_base::{
     identifiers::ChainId,
 };
 #[cfg(with_testing)]
-use linera_views::context::{create_test_memory_context, MemoryContext};
+use linera_views::context::MemoryContext;
 use linera_views::{
     context::Context,
     queue_view::QueueView,
     register_view::RegisterView,
-    views::{ClonableView, View, ViewError},
+    views::{ClonableView, View},
+    ViewError,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{data_types::MessageBundle, ChainError, Origin};
+use crate::{data_types::MessageBundle, ChainError};
 
 #[cfg(test)]
 #[path = "unit_tests/inbox_tests.rs"]
 mod inbox_tests;
+
+#[cfg(with_metrics)]
+mod metrics {
+    use std::sync::LazyLock;
+
+    use linera_base::prometheus_util::{exponential_bucket_interval, register_histogram_vec};
+    use prometheus::HistogramVec;
+
+    pub static INBOX_SIZE: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "inbox_size",
+            "Inbox size",
+            &[],
+            exponential_bucket_interval(1.0, 2_000_000.0),
+        )
+    });
+
+    pub static REMOVED_BUNDLES: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "removed_bundles",
+            "Number of bundles removed by anticipation",
+            &[],
+            exponential_bucket_interval(1.0, 10_000.0),
+        )
+    });
+}
 
 /// The state of an inbox.
 /// * An inbox is used to track bundles received and executed locally.
@@ -36,10 +64,12 @@ mod inbox_tests;
 /// * The cursors of added bundles (resp. removed bundles) must be increasing over time.
 /// * Reconciliation of added and removed bundles is allowed to skip some added bundles.
 ///   However, the opposite is not true: every removed bundle must be eventually added.
-#[derive(Debug, ClonableView, View, async_graphql::SimpleObject)]
+#[cfg_attr(with_graphql, derive(async_graphql::SimpleObject))]
+#[derive(Allocative, Debug, ClonableView, View)]
+#[allocative(bound = "C")]
 pub struct InboxStateView<C>
 where
-    C: Clone + Context + Send + Sync,
+    C: Clone + Context,
 {
     /// We have already added all the messages below this height and index.
     pub next_cursor_to_add: RegisterView<C, Cursor>,
@@ -65,6 +95,7 @@ where
     Serialize,
     Deserialize,
     SimpleObject,
+    Allocative,
 )]
 pub struct Cursor {
     height: BlockHeight,
@@ -114,8 +145,8 @@ impl Cursor {
     }
 }
 
-impl From<(ChainId, Origin, InboxError)> for ChainError {
-    fn from(value: (ChainId, Origin, InboxError)) -> Self {
+impl From<(ChainId, ChainId, InboxError)> for ChainError {
+    fn from(value: (ChainId, ChainId, InboxError)) -> Self {
         let (chain_id, origin, error) = value;
         match error {
             InboxError::ViewError(e) => ChainError::ViewError(e),
@@ -125,7 +156,7 @@ impl From<(ChainId, Origin, InboxError)> for ChainError {
                 previous_bundle,
             } => ChainError::UnexpectedMessage {
                 chain_id,
-                origin: origin.into(),
+                origin,
                 bundle: Box::new(bundle),
                 previous_bundle: Box::new(previous_bundle),
             },
@@ -134,14 +165,14 @@ impl From<(ChainId, Origin, InboxError)> for ChainError {
                 next_cursor,
             } => ChainError::IncorrectMessageOrder {
                 chain_id,
-                origin: origin.into(),
+                origin,
                 bundle: Box::new(bundle),
                 next_height: next_cursor.height,
                 next_index: next_cursor.index,
             },
             InboxError::UnskippableBundle { bundle } => ChainError::CannotSkipMessage {
                 chain_id,
-                origin: origin.into(),
+                origin,
                 bundle: Box::new(bundle),
             },
         }
@@ -150,7 +181,7 @@ impl From<(ChainId, Origin, InboxError)> for ChainError {
 
 impl<C> InboxStateView<C>
 where
-    C: Context + Clone + Send + Sync + 'static,
+    C: Context + Clone + 'static,
 {
     /// Converts the internal cursor for added bundles into an externally-visible block height.
     /// This makes sense because the rest of the system always adds bundles one block at a time.
@@ -191,6 +222,10 @@ where
                 }
             );
             self.added_bundles.delete_front();
+            #[cfg(with_metrics)]
+            metrics::INBOX_SIZE
+                .with_label_values(&[])
+                .observe(self.added_bundles.count() as f64);
             tracing::trace!("Skipping previously received bundle {:?}", previous_bundle);
         }
         // Reconcile the bundle with the next added bundle, or mark it as removed.
@@ -209,12 +244,20 @@ where
                     }
                 );
                 self.added_bundles.delete_front();
+                #[cfg(with_metrics)]
+                metrics::INBOX_SIZE
+                    .with_label_values(&[])
+                    .observe(self.added_bundles.count() as f64);
                 tracing::trace!("Consuming bundle {:?}", bundle);
                 true
             }
             None => {
                 tracing::trace!("Marking bundle as expected: {:?}", bundle);
                 self.removed_bundles.push_back(bundle.clone());
+                #[cfg(with_metrics)]
+                metrics::REMOVED_BUNDLES
+                    .with_label_values(&[])
+                    .observe(self.removed_bundles.count() as f64);
                 false
             }
         };
@@ -250,6 +293,10 @@ where
                         }
                     );
                     self.removed_bundles.delete_front();
+                    #[cfg(with_metrics)]
+                    metrics::REMOVED_BUNDLES
+                        .with_label_values(&[])
+                        .observe(self.removed_bundles.count() as f64);
                 } else {
                     // The receiver has already executed a later bundle from the same
                     // sender ahead of time so we should skip this one.
@@ -266,6 +313,10 @@ where
             None => {
                 // Otherwise, schedule the messages for execution.
                 self.added_bundles.push_back(bundle);
+                #[cfg(with_metrics)]
+                metrics::INBOX_SIZE
+                    .with_label_values(&[])
+                    .observe(self.added_bundles.count() as f64);
                 true
             }
         };
@@ -280,7 +331,7 @@ where
     MemoryContext<()>: Context + Clone + Send + Sync + 'static,
 {
     pub async fn new() -> Self {
-        let context = create_test_memory_context();
+        let context = MemoryContext::new_for_testing(());
         Self::load(context)
             .await
             .expect("Loading from memory should work")

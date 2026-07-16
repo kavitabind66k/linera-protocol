@@ -4,7 +4,6 @@
 //! Helper types for using [`linera_views`] to store application state.
 
 mod aliases;
-mod conversions_to_wit;
 #[cfg(with_testing)]
 mod mock_key_value_store;
 mod system_api;
@@ -12,7 +11,8 @@ mod system_api;
 pub use linera_views::{
     self,
     common::CustomSerialize,
-    views::{RootView, View, ViewError},
+    views::{RootView, View},
+    ViewError,
 };
 
 pub use self::{

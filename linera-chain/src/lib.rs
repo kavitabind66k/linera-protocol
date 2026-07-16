@@ -3,34 +3,33 @@
 
 //! This module manages the state of a Linera chain, including cross-chain communication.
 
-#![deny(clippy::large_futures)]
-
-mod block;
+pub mod block;
 mod certificate;
 
 pub mod types {
     pub use super::{block::*, certificate::*};
 }
 
+mod block_tracker;
 mod chain;
 pub mod data_types;
 mod inbox;
 pub mod manager;
 mod outbox;
+mod pending_blobs;
 #[cfg(with_testing)]
 pub mod test;
 
 pub use chain::ChainStateView;
-use data_types::{MessageBundle, Origin, PostedMessage};
+use data_types::{MessageBundle, PostedMessage};
 use linera_base::{
     bcs,
-    crypto::{CryptoError, CryptoHash},
+    crypto::CryptoError,
     data_types::{ArithmeticError, BlockHeight, Round, Timestamp},
-    identifiers::{ApplicationId, BlobId, ChainId},
+    identifiers::{ApplicationId, ChainId},
 };
 use linera_execution::ExecutionError;
-use linera_views::views::ViewError;
-use rand_distr::WeightedError;
+use linera_views::ViewError;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -40,63 +39,63 @@ pub enum ChainError {
     #[error(transparent)]
     ArithmeticError(#[from] ArithmeticError),
     #[error(transparent)]
-    ViewError(ViewError),
+    ViewError(#[from] ViewError),
     #[error("Execution error: {0} during {1:?}")]
     ExecutionError(Box<ExecutionError>, ChainExecutionContext),
 
-    #[error("The chain being queried is not active {0:?}")]
+    #[error("The chain being queried is not active {0}")]
     InactiveChain(ChainId),
     #[error(
-        "Cannot vote for block proposal of chain {chain_id:?} because a message \
-         from origin {origin:?} at height {height:?} has not been received yet"
+        "Cannot vote for block proposal of chain {chain_id} because a message \
+         from chain {origin} at height {height} has not been received yet"
     )]
     MissingCrossChainUpdate {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         height: BlockHeight,
     },
     #[error(
-        "Message in block proposed to {chain_id:?} does not match the previously received messages from \
+        "Message in block proposed to {chain_id} does not match the previously received messages from \
         origin {origin:?}: was {bundle:?} instead of {previous_bundle:?}"
     )]
     UnexpectedMessage {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         bundle: Box<MessageBundle>,
         previous_bundle: Box<MessageBundle>,
     },
     #[error(
-        "Message in block proposed to {chain_id:?} is out of order compared to previous messages \
+        "Message in block proposed to {chain_id} is out of order compared to previous messages \
          from origin {origin:?}: {bundle:?}. Block and height should be at least: \
          {next_height}, {next_index}"
     )]
     IncorrectMessageOrder {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         bundle: Box<MessageBundle>,
         next_height: BlockHeight,
         next_index: u32,
     },
     #[error(
-        "Block proposed to {chain_id:?} is attempting to reject protected message \
+        "Block proposed to {chain_id} is attempting to reject protected message \
         {posted_message:?}"
     )]
     CannotRejectMessage {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         posted_message: Box<PostedMessage>,
     },
     #[error(
-        "Block proposed to {chain_id:?} is attempting to skip a message bundle \
+        "Block proposed to {chain_id} is attempting to skip a message bundle \
          that cannot be skipped: {bundle:?}"
     )]
     CannotSkipMessage {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         bundle: Box<MessageBundle>,
     },
     #[error(
-        "Incoming message bundle in block proposed to {chain_id:?} has timestamp \
+        "Incoming message bundle in block proposed to {chain_id} has timestamp \
         {bundle_timestamp:}, which is later than the block timestamp {block_timestamp:}."
     )]
     IncorrectBundleTimestamp {
@@ -107,7 +106,8 @@ pub enum ChainError {
     #[error("The signature was not created by a valid entity")]
     InvalidSigner,
     #[error(
-        "Was expecting block height {expected_block_height} but found {found_block_height} instead"
+        "Chain is expecting a next block at height {expected_block_height} but the given block \
+        is at height {found_block_height} instead"
     )]
     UnexpectedBlockHeight {
         expected_block_height: BlockHeight,
@@ -116,66 +116,96 @@ pub enum ChainError {
     #[error("The previous block hash of a new block should match the last block of the chain")]
     UnexpectedPreviousBlockHash,
     #[error("Sequence numbers above the maximal value are not usable for blocks")]
-    InvalidBlockHeight,
-    #[error("Block timestamp must not be earlier than the parent block's.")]
-    InvalidBlockTimestamp,
-    #[error("Cannot initiate a new block while the previous one is still pending confirmation")]
-    PreviousBlockMustBeConfirmedFirst,
+    BlockHeightOverflow,
+    #[error(
+        "Block timestamp {new} must not be earlier than the parent block's timestamp {parent}"
+    )]
+    InvalidBlockTimestamp { parent: Timestamp, new: Timestamp },
     #[error("Round number should be at least {0:?}")]
     InsufficientRound(Round),
     #[error("Round number should be greater than {0:?}")]
     InsufficientRoundStrict(Round),
     #[error("Round number should be {0:?}")]
     WrongRound(Round),
-    #[error("A different block for height {0:?} was already locked at round number {1:?}")]
-    HasLockedBlock(BlockHeight, Round),
+    #[error("Already voted to confirm a different block for height {0:?} at round number {1:?}")]
+    HasIncompatibleConfirmedVote(BlockHeight, Round),
+    #[error("Proposal for height {0:?} is not newer than locking block in round {1:?}")]
+    MustBeNewerThanLockingBlock(BlockHeight, Round),
     #[error("Cannot confirm a block before its predecessors: {current_block_height:?}")]
     MissingEarlierBlocks { current_block_height: BlockHeight },
     #[error("Signatures in a certificate must be from different validators")]
     CertificateValidatorReuse,
     #[error("Signatures in a certificate must form a quorum")]
     CertificateRequiresQuorum,
-    #[error("Certificate signature verification failed: {error}")]
-    CertificateSignatureVerificationFailed { error: String },
     #[error("Internal error {0}")]
     InternalError(String),
-    #[error("Block proposal is too large")]
-    BlockProposalTooLarge,
+    #[error("Block proposal has size {0} which is too large")]
+    BlockProposalTooLarge(usize),
     #[error(transparent)]
     BcsError(#[from] bcs::Error),
-    #[error("Insufficient balance to pay the fees")]
-    InsufficientBalance,
-    #[error("Invalid owner weights: {0}")]
-    OwnerWeightError(#[from] WeightedError),
     #[error("Closed chains cannot have operations, accepted messages or empty blocks")]
     ClosedChain,
+    #[error("Empty blocks are not allowed")]
+    EmptyBlock,
     #[error("All operations on this chain must be from one of the following applications: {0:?}")]
     AuthorizedApplications(Vec<ApplicationId>),
     #[error("Missing operations or messages from mandatory applications: {0:?}")]
     MissingMandatoryApplications(Vec<ApplicationId>),
-    #[error("Can't use grant across different broadcast messages")]
-    GrantUseOnBroadcast,
-    #[error("ExecutedBlock contains fewer oracle responses than requests")]
+    #[error("Executed block contains fewer oracle responses than requests")]
     MissingOracleResponseList,
-    #[error("Unexpected hash for CertificateValue! Expected: {expected:?}, Actual: {actual:?}")]
-    CertificateValueHashMismatch {
-        expected: CryptoHash,
-        actual: CryptoHash,
-    },
-    #[error("Blobs not found: {0:?}")]
-    BlobsNotFound(Vec<BlobId>),
+    #[error("Not signing timeout certificate; current round does not time out")]
+    RoundDoesNotTimeOut,
+    #[error("Not signing timeout certificate; current round times out at time {0}")]
+    NotTimedOutYet(Timestamp),
 }
 
-impl From<ViewError> for ChainError {
-    fn from(error: ViewError) -> Self {
-        match error {
-            ViewError::BlobsNotFound(blob_ids) => ChainError::BlobsNotFound(blob_ids),
-            error => ChainError::ViewError(error),
+impl ChainError {
+    /// Returns whether this error is caused by an issue in the local node.
+    ///
+    /// Returns `false` whenever the error could be caused by a bad message from a peer.
+    pub fn is_local(&self) -> bool {
+        match self {
+            ChainError::CryptoError(_)
+            | ChainError::ArithmeticError(_)
+            | ChainError::ViewError(ViewError::NotFound(_))
+            | ChainError::InactiveChain(_)
+            | ChainError::IncorrectMessageOrder { .. }
+            | ChainError::CannotRejectMessage { .. }
+            | ChainError::CannotSkipMessage { .. }
+            | ChainError::IncorrectBundleTimestamp { .. }
+            | ChainError::InvalidSigner
+            | ChainError::UnexpectedBlockHeight { .. }
+            | ChainError::UnexpectedPreviousBlockHash
+            | ChainError::BlockHeightOverflow
+            | ChainError::InvalidBlockTimestamp { .. }
+            | ChainError::InsufficientRound(_)
+            | ChainError::InsufficientRoundStrict(_)
+            | ChainError::WrongRound(_)
+            | ChainError::HasIncompatibleConfirmedVote(..)
+            | ChainError::MustBeNewerThanLockingBlock(..)
+            | ChainError::MissingEarlierBlocks { .. }
+            | ChainError::CertificateValidatorReuse
+            | ChainError::CertificateRequiresQuorum
+            | ChainError::BlockProposalTooLarge(_)
+            | ChainError::ClosedChain
+            | ChainError::EmptyBlock
+            | ChainError::AuthorizedApplications(_)
+            | ChainError::MissingMandatoryApplications(_)
+            | ChainError::MissingOracleResponseList
+            | ChainError::RoundDoesNotTimeOut
+            | ChainError::NotTimedOutYet(_)
+            | ChainError::MissingCrossChainUpdate { .. } => false,
+            ChainError::ViewError(_)
+            | ChainError::UnexpectedMessage { .. }
+            | ChainError::InternalError(_)
+            | ChainError::BcsError(_) => true,
+            ChainError::ExecutionError(execution_error, _) => execution_error.is_local(),
         }
     }
 }
 
 #[derive(Copy, Clone, Debug)]
+#[cfg_attr(with_testing, derive(Eq, PartialEq))]
 pub enum ChainExecutionContext {
     Query,
     DescribeApplication,
@@ -184,7 +214,7 @@ pub enum ChainExecutionContext {
     Block,
 }
 
-trait ExecutionResultExt<T> {
+pub trait ExecutionResultExt<T> {
     fn with_execution_context(self, context: ChainExecutionContext) -> Result<T, ChainError>;
 }
 

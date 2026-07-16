@@ -13,8 +13,7 @@ service NotifierService {
 // Interface provided by each physical shard (aka "worker") of a validator or a local node.
 // * All commands return either the current chain info or an error.
 // * Repeating commands produces no changes and returns no error.
-// * Some handlers may return cross-chain requests, that is, messages
-//   to be communicated to other workers of the same validator.
+// * Some handlers may return cross-chain requests, that is, messages to be communicated to other workers of the same validator.
 service ValidatorWorker {
   // Propose a new block.
   rpc HandleBlockProposal(BlockProposal) returns (ChainInfoResult);
@@ -64,8 +63,11 @@ service ValidatorNode {
   // Request the node's version info.
   rpc GetVersionInfo(google.protobuf.Empty) returns (VersionInfo);
 
-  // Request the genesis configuration hash of the network this node is part of.
-  rpc GetGenesisConfigHash(google.protobuf.Empty) returns (CryptoHash);
+  // Request the network description seen by this node.
+  rpc GetNetworkDescription(google.protobuf.Empty) returns (NetworkDescription);
+
+  // Request shard information for a specific chain.
+  rpc GetShardInfo(ChainId) returns (ShardInfo);
 
   // Download a blob.
   rpc DownloadBlob(BlobId) returns (BlobContent);
@@ -86,11 +88,40 @@ service ValidatorNode {
   // Download a batch of certificates.
   rpc DownloadCertificates(CertificatesBatchRequest) returns (CertificatesBatchResponse);
 
+  /// Download a batch of certificates by heights.
+  rpc DownloadCertificatesByHeights(DownloadCertificatesByHeightsRequest) returns (CertificatesBatchResponse);
+
+  // Download a batch of certificates, in serialized form, by their heights.
+  rpc DownloadRawCertificatesByHeights(DownloadCertificatesByHeightsRequest) returns (RawCertificatesBatch);
+
   // Return the hash of the `Certificate` that last used a blob.
   rpc BlobLastUsedBy(BlobId) returns (CryptoHash);
 
+  // Returns the certificate that last used the blob.
+  rpc BlobLastUsedByCertificate(BlobId) returns (Certificate);
+
+
   // Return the `BlobId`s that are not contained as `Blob`.
   rpc MissingBlobIds(BlobIds) returns (BlobIds);
+}
+
+// Batch of raw certificates.
+message RawCertificatesBatch {
+  repeated RawCertificate certificates = 1;
+}
+
+// A confirmed block certificate in a serialized form.
+message RawCertificate {
+  // BCS-serialized bytes of lite certificate part.
+  bytes lite_certificate = 1;
+  // BCS-serialized bytes of confirmed block part.
+  bytes confirmed_block = 2;
+}
+
+// A request for downloading certificates by block heights.
+message DownloadCertificatesByHeightsRequest {
+  ChainId chain_id = 1;
+  repeated BlockHeight heights = 2;
 }
 
 // A request for a batch of certificates.
@@ -118,6 +149,20 @@ message VersionInfo {
     string rpc_hash = 4;
     string graphql_hash = 5;
     string wit_hash = 6;
+}
+
+message NetworkDescription {
+    string name = 1;
+    CryptoHash genesis_config_hash = 2;
+    uint64 genesis_timestamp = 3;
+    ChainId admin_chain_id = 4;
+    CryptoHash genesis_committee_blob_hash = 5;
+}
+
+// Information about shard configuration for a specific chain.
+message ShardInfo {
+    uint64 shard_id = 1;
+    uint64 total_shards = 2;
 }
 
 // A request for client to subscribe to notifications for a given `ChainId`
@@ -153,18 +198,20 @@ message CrossChainRequest {
 message UpdateRecipient {
   ChainId sender = 1;
   ChainId recipient = 2;
-  bytes bundle_vecs = 3;
+  bytes bundles = 3;
 }
 
 // Acknowledge the height of the highest confirmed blocks communicated with `UpdateRecipient`.
 message ConfirmUpdatedRecipient {
   ChainId sender = 1;
   ChainId recipient = 2;
-  bytes latest_heights = 3;
+  BlockHeight latest_height = 3;
 }
 
 // Request information on a chain.
 message ChainInfoQuery {
+  // Removed `request_sent_certificate_hashes_in_range`
+  reserved 5;
   // The chain ID
   ChainId chain_id = 1;
 
@@ -174,11 +221,8 @@ message ChainInfoQuery {
   // Query the current committees
   bool request_committees = 3;
 
-  // Query the received messages that are waiting be picked in the next block.
+  // Query the received messages that are waiting to be picked in the next block.
   bool request_pending_message_bundles = 4;
-
-  // Query a range of certificates hashes sent from the chain.
-  optional bytes request_sent_certificate_hashes_in_range = 5;
 
   // Query new certificate removed from the chain.
   optional uint64 request_received_log_excluding_first_n = 6;
@@ -186,14 +230,20 @@ message ChainInfoQuery {
   // Query values from the chain manager, not just votes.
   bool request_manager_values = 7;
 
-  // Request a signed vote for a leader timeout.
-  bool request_leader_timeout = 8;
+  // Request a signed vote for a leader timeout for the given height and round.
+  optional bytes request_leader_timeout = 8;
 
   // Query the balance of a given owner.
-  optional AccountOwner request_owner_balance = 9;
+  AccountOwner request_owner_balance = 9;
 
   // Request a signed vote for fallback mode.
   bool request_fallback = 10;
+
+  // Query for certificate hashes at block heights sent from the chain.
+  optional bytes request_sent_certificate_hashes_by_heights = 11;
+
+  // Whether to create network actions as part of the query.
+  optional bool create_network_actions = 12;
 }
 
 // An authenticated proposal for a new block.
@@ -204,17 +254,15 @@ message BlockProposal {
   // bincode-encoded content
   bytes content = 2;
 
-  // Byte-encoded public key
-  Owner owner = 3;
+  // Byte-encoded owner
+  AccountOwner owner = 4;
 
-  // Signature value
-  Signature signature = 4;
+  // Signature by chain owner
+  AccountSignature signature = 5;
 
-  // A lite certificate for a validated block that justifies the proposal in this round.
-  optional bytes validated_block_certificate = 6;
-
-  // Required blob
-  bytes blobs = 7;
+  // A lite certificate for a validated block, or a fast block proposal, that
+  // justifies the proposal in this round.
+  optional bytes original_proposal = 6;
 }
 
 // A certified statement from the committee, without the value.
@@ -321,7 +369,14 @@ message ChainId {
   bytes bytes = 1;
 }
 
-message PublicKey {
+/// Public key of a validator.
+message ValidatorPublicKey {
+  bytes bytes = 1;
+}
+
+/// Public key of a Linera account.
+/// Corresponding private key is used to sign block proposals.
+message AccountPublicKey {
   bytes bytes = 1;
 }
 
@@ -333,11 +388,13 @@ message AccountOwner {
   bytes bytes = 1;
 }
 
-message Owner {
+/// Signature created by a validator.
+message ValidatorSignature {
   bytes bytes = 1;
 }
 
-message Signature {
+/// Signature created by a Linera account.
+message AccountSignature {
   bytes bytes = 1;
 }
 
@@ -361,8 +418,8 @@ message ChainInfoResponse {
   // bincode-encoded chain info
   bytes chain_info = 1;
 
-  // Optional signature for the response.
-  optional Signature signature = 2;
+  // Optional validator signature for the response.
+  optional ValidatorSignature signature = 2;
 }
 
 message BlockHeight {

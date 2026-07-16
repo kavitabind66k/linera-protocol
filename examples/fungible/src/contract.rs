@@ -5,13 +5,11 @@
 
 mod state;
 
-use std::str::FromStr;
-
 use fungible::{
-    Account, FungibleResponse, FungibleTokenAbi, InitialState, Message, Operation, Parameters,
+    FungibleOperation, FungibleResponse, FungibleTokenAbi, InitialState, Message, Parameters,
 };
 use linera_sdk::{
-    base::{AccountOwner, Amount, WithContractAbi},
+    linera_base_types::{Account, AccountOwner, Amount, WithContractAbi},
     views::{RootView, View},
     Contract, ContractRuntime,
 };
@@ -33,6 +31,7 @@ impl Contract for FungibleTokenContract {
     type Message = Message;
     type Parameters = Parameters;
     type InstantiationArgument = InitialState;
+    type EventValue = ();
 
     async fn load(runtime: ContractRuntime<Self>) -> Self {
         let state = FungibleTokenState::load(runtime.root_view_storage_context())
@@ -41,52 +40,83 @@ impl Contract for FungibleTokenContract {
         FungibleTokenContract { state, runtime }
     }
 
-    async fn instantiate(&mut self, mut state: Self::InstantiationArgument) {
+    async fn instantiate(&mut self, state: Self::InstantiationArgument) {
         // Validate that the application parameters were configured correctly.
         let _ = self.runtime.application_parameters();
 
-        // If initial accounts are empty, creator gets 1M tokens to act like a faucet.
-        if state.accounts.is_empty() {
-            if let Some(owner) = self.runtime.authenticated_signer() {
-                state.accounts.insert(
-                    AccountOwner::User(owner),
-                    Amount::from_str("1000000").unwrap(),
-                );
-            }
+        let mut total_supply = Amount::ZERO;
+        for value in state.accounts.values() {
+            total_supply.saturating_add_assign(*value);
+        }
+        if total_supply == Amount::ZERO {
+            panic!("The total supply is zero, therefore we cannot instantiate the contract");
         }
         self.state.initialize_accounts(state).await;
     }
 
     async fn execute_operation(&mut self, operation: Self::Operation) -> Self::Response {
         match operation {
-            Operation::Balance { owner } => {
+            FungibleOperation::Balance { owner } => {
                 let balance = self.state.balance_or_default(&owner).await;
                 FungibleResponse::Balance(balance)
             }
 
-            Operation::TickerSymbol => {
+            FungibleOperation::TickerSymbol => {
                 let params = self.runtime.application_parameters();
                 FungibleResponse::TickerSymbol(params.ticker_symbol)
             }
 
-            Operation::Transfer {
+            FungibleOperation::Approve {
+                owner,
+                spender,
+                allowance,
+            } => {
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for Transfer operation");
+                self.state.approve(owner, spender, allowance).await;
+                FungibleResponse::Ok
+            }
+
+            FungibleOperation::Transfer {
                 owner,
                 amount,
                 target_account,
             } => {
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for Transfer operation");
                 self.state.debit(owner, amount).await;
                 self.finish_transfer_to_account(amount, target_account, owner)
                     .await;
                 FungibleResponse::Ok
             }
 
-            Operation::Claim {
+            FungibleOperation::TransferFrom {
+                owner,
+                spender,
+                amount,
+                target_account,
+            } => {
+                self.runtime
+                    .check_account_permission(spender)
+                    .expect("Permission for Transfer operation");
+                self.state
+                    .debit_for_transfer_from(owner, spender, amount)
+                    .await;
+                self.finish_transfer_to_account(amount, target_account, owner)
+                    .await;
+                FungibleResponse::Ok
+            }
+
+            FungibleOperation::Claim {
                 source_account,
                 amount,
                 target_account,
             } => {
-                self.check_account_authentication(source_account.owner);
+                self.runtime
+                    .check_account_permission(source_account.owner)
+                    .expect("Permission for Claim operation");
                 self.claim(source_account, amount, target_account).await;
                 FungibleResponse::Ok
             }
@@ -112,7 +142,9 @@ impl Contract for FungibleTokenContract {
                 amount,
                 target_account,
             } => {
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for Withdraw message");
                 self.state.debit(owner, amount).await;
                 self.finish_transfer_to_account(amount, target_account, owner)
                     .await;
@@ -126,26 +158,6 @@ impl Contract for FungibleTokenContract {
 }
 
 impl FungibleTokenContract {
-    /// Verifies that a transfer is authenticated for this local account.
-    fn check_account_authentication(&mut self, owner: AccountOwner) {
-        match owner {
-            AccountOwner::User(address) => {
-                assert_eq!(
-                    self.runtime.authenticated_signer(),
-                    Some(address),
-                    "The requested transfer is not correctly authenticated."
-                )
-            }
-            AccountOwner::Application(id) => {
-                assert_eq!(
-                    self.runtime.authenticated_caller_id(),
-                    Some(id),
-                    "The requested transfer is not correctly authenticated."
-                )
-            }
-        }
-    }
-
     async fn claim(&mut self, source_account: Account, amount: Amount, target_account: Account) {
         if source_account.chain_id == self.runtime.chain_id() {
             self.state.debit(source_account.owner, amount).await;

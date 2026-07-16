@@ -2,10 +2,14 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::borrow::Cow;
+use std::{borrow::Cow, ops::Deref};
 
-use linera_base::{crypto::Signature, data_types::Round, hashed::Hashed};
-use linera_execution::committee::{Committee, ValidatorName};
+use allocative::{Allocative, Key, Visitor};
+use linera_base::{
+    crypto::{ValidatorPublicKey, ValidatorSignature},
+    data_types::Round,
+};
+use linera_execution::committee::Committee;
 use serde::{Deserialize, Serialize};
 
 use super::{CertificateValue, GenericCertificate};
@@ -23,14 +27,27 @@ pub struct LiteCertificate<'a> {
     /// The round in which the value was certified.
     pub round: Round,
     /// Signatures on the value.
-    pub signatures: Cow<'a, [(ValidatorName, Signature)]>,
+    pub signatures: Cow<'a, [(ValidatorPublicKey, ValidatorSignature)]>,
 }
 
-impl<'a> LiteCertificate<'a> {
+impl Allocative for LiteCertificate<'_> {
+    fn visit<'a, 'b: 'a>(&self, visitor: &'a mut Visitor<'b>) {
+        visitor.visit_field(Key::new("LiteCertificate_value"), &self.value);
+        visitor.visit_field(Key::new("LiteCertificate_round"), &self.round);
+        if matches!(self.signatures, Cow::Owned(_)) {
+            for (public_key, signature) in self.signatures.deref() {
+                visitor.visit_field(Key::new("ValidatorPublicKey"), public_key);
+                visitor.visit_field(Key::new("ValidatorSignature"), signature);
+            }
+        }
+    }
+}
+
+impl LiteCertificate<'_> {
     pub fn new(
         value: LiteValue,
         round: Round,
-        mut signatures: Vec<(ValidatorName, Signature)>,
+        mut signatures: Vec<(ValidatorPublicKey, ValidatorSignature)>,
     ) -> Self {
         signatures.sort_by_key(|&(validator_name, _)| validator_name);
 
@@ -42,22 +59,26 @@ impl<'a> LiteCertificate<'a> {
         }
     }
 
-    /// Creates a [`LiteCertificate`] from a list of votes, without cryptographically checking the
+    /// Creates a [`LiteCertificate`] from a list of votes with their validator public keys, without cryptographically checking the
     /// signatures. Returns `None` if the votes are empty or don't have matching values and rounds.
-    pub fn try_from_votes(votes: impl IntoIterator<Item = LiteVote>) -> Option<Self> {
+    pub fn try_from_votes(
+        votes: impl IntoIterator<Item = (ValidatorPublicKey, LiteVote)>,
+    ) -> Option<Self> {
         let mut votes = votes.into_iter();
-        let LiteVote {
-            value,
-            round,
-            validator,
-            signature,
-        } = votes.next()?;
-        let mut signatures = vec![(validator, signature)];
-        for vote in votes {
+        let (
+            public_key,
+            LiteVote {
+                value,
+                round,
+                signature,
+            },
+        ) = votes.next()?;
+        let mut signatures = vec![(public_key, signature)];
+        for (validator_key, vote) in votes {
             if vote.value.value_hash != value.value_hash || vote.round != round {
                 return None;
             }
-            signatures.push((vote.validator, vote.signature));
+            signatures.push((validator_key, vote.signature));
         }
         Some(LiteCertificate::new(value, round, signatures))
     }
@@ -74,12 +95,16 @@ impl<'a> LiteCertificate<'a> {
         Ok(&self.value)
     }
 
+    /// Checks whether the value matches this certificate.
+    pub fn check_value<T: CertificateValue>(&self, value: &T) -> bool {
+        self.value.chain_id == value.chain_id()
+            && T::KIND == self.value.kind
+            && self.value.value_hash == value.hash()
+    }
+
     /// Returns the [`GenericCertificate`] with the specified value, if it matches.
-    pub fn with_value<T: CertificateValue>(
-        self,
-        value: Hashed<T>,
-    ) -> Option<GenericCertificate<T>> {
-        if self.value.chain_id != value.inner().chain_id()
+    pub fn with_value<T: CertificateValue>(self, value: T) -> Option<GenericCertificate<T>> {
+        if self.value.chain_id != value.chain_id()
             || T::KIND != self.value.kind
             || self.value.value_hash != value.hash()
         {

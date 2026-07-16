@@ -45,14 +45,14 @@ impl<'input> FieldsInformation<'input> {
             .map(FieldInformation::wit_type_name)
     }
 
-    /// Returns the code with a pattern to match a heterogenous list using the `field_names` as
+    /// Returns the code with a pattern to match a heterogeneous list using the `field_names` as
     /// bindings.
     pub fn hlist_type(&self) -> TokenStream {
         let field_types = self.types();
         quote! { linera_witty::HList![#( #field_types ),*] }
     }
 
-    /// Returns the code with a pattern to match a heterogenous list using the `field_names` as
+    /// Returns the code with a pattern to match a heterogeneous list using the `field_names` as
     /// bindings.
     ///
     /// This function receives `field_names` instead of a `Fields` instance because some fields might
@@ -103,7 +103,7 @@ impl<'input> FieldsInformation<'input> {
             FieldsKind::Unit => quote! {},
             FieldsKind::Named => {
                 let bindings = self.non_skipped_fields().map(FieldInformation::name);
-                let has_skipped_fields = self.fields.iter().any(|field| field.is_skipped());
+                let has_skipped_fields = self.fields.iter().any(FieldInformation::is_skipped);
                 let ignored_fields = has_skipped_fields.then(|| quote! { .. });
 
                 quote! { { #( #bindings, )* #ignored_fields } }
@@ -186,15 +186,13 @@ impl<'input> From<(usize, &'input Field)> for FieldInformation<'input> {
         let name = field
             .ident
             .as_ref()
-            .map(Cow::Borrowed)
-            .unwrap_or_else(|| Cow::Owned(format_ident!("field{index}")));
+            .map_or_else(|| Cow::Owned(format_ident!("field{index}")), Cow::Borrowed);
 
         let wit_name = LitStr::new(
             &field
                 .ident
                 .as_ref()
-                .map(Ident::to_string)
-                .unwrap_or_else(|| format!("inner{index}"))
+                .map_or_else(|| format!("inner{index}"), Ident::to_string)
                 .to_kebab_case(),
             field.span(),
         );

@@ -2,30 +2,30 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, ops::Not};
+use std::{collections::BTreeMap, fmt, ops::Not};
 
 use custom_debug_derive::Debug;
 use linera_base::{
-    crypto::{BcsSignable, CryptoError, CryptoHash, KeyPair, Signature},
-    data_types::{Amount, BlockHeight, Round, Timestamp},
-    identifiers::{AccountOwner, ChainDescription, ChainId},
+    crypto::{
+        BcsSignable, CryptoError, CryptoHash, ValidatorPublicKey, ValidatorSecretKey,
+        ValidatorSignature,
+    },
+    data_types::{Amount, BlockHeight, ChainDescription, Epoch, Round, Timestamp},
+    identifiers::{AccountOwner, ChainId},
 };
 use linera_chain::{
-    data_types::{ChainAndHeight, IncomingBundle, Medium, MessageBundle},
+    data_types::{ChainAndHeight, IncomingBundle, MessageBundle},
     manager::ChainManagerInfo,
     ChainStateView,
 };
-use linera_execution::{
-    committee::{Committee, Epoch, ValidatorName},
-    ExecutionRuntimeContext,
-};
+use linera_execution::{committee::Committee, ExecutionRuntimeContext};
 use linera_storage::ChainRuntimeContext;
 use linera_views::context::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::client::ChainClientError;
+use crate::client::chain_client;
 
-/// A range of block heights as used in ChainInfoQuery.
+/// A range of block heights as used in `ChainInfoQuery`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(with_testing, derive(test_strategy::Arbitrary, Eq, PartialEq))]
 pub struct BlockHeightRange {
@@ -68,15 +68,16 @@ pub struct ChainInfoQuery {
     #[debug(skip_if = Option::is_none)]
     pub test_next_block_height: Option<BlockHeight>,
     /// Request the balance of a given [`AccountOwner`].
-    #[debug(skip_if = Option::is_none)]
-    pub request_owner_balance: Option<AccountOwner>,
+    pub request_owner_balance: AccountOwner,
     /// Query the current committees.
     #[debug(skip_if = Not::not)]
     pub request_committees: bool,
-    /// Query the received messages that are waiting be picked in the next block.
+    /// Query the received messages that are waiting to be picked in the next block.
     #[debug(skip_if = Not::not)]
     pub request_pending_message_bundles: bool,
     /// Query a range of certificate hashes sent from the chain.
+    //  dev: this field is left and unused to maintain backwards compatibility
+    //  after hotfixing Testnet Conway.
     #[debug(skip_if = Option::is_none)]
     pub request_sent_certificate_hashes_in_range: Option<BlockHeightRange>,
     /// Query new certificate sender chain IDs and block heights received from the chain.
@@ -85,12 +86,23 @@ pub struct ChainInfoQuery {
     /// Query values from the chain manager, not just votes.
     #[debug(skip_if = Not::not)]
     pub request_manager_values: bool,
-    /// Include a timeout vote for the current round, if appropriate.
-    #[debug(skip_if = Not::not)]
-    pub request_leader_timeout: bool,
+    /// Include a timeout vote for the specified round, if appropriate.
+    #[debug(skip_if = Option::is_none)]
+    pub request_leader_timeout: Option<(BlockHeight, Round)>,
     /// Include a vote to switch to fallback mode, if appropriate.
     #[debug(skip_if = Not::not)]
     pub request_fallback: bool,
+    /// Query for certificate hashes at block heights.
+    #[debug(skip_if = Vec::is_empty)]
+    pub request_sent_certificate_hashes_by_heights: Vec<BlockHeight>,
+    #[serde(default = "default_true")]
+    pub create_network_actions: bool,
+}
+
+// Default value for create_network_actions.
+// Default for bool returns false.
+fn default_true() -> bool {
+    true
 }
 
 impl ChainInfoQuery {
@@ -99,13 +111,15 @@ impl ChainInfoQuery {
             chain_id,
             test_next_block_height: None,
             request_committees: false,
-            request_owner_balance: None,
+            request_owner_balance: AccountOwner::CHAIN,
             request_pending_message_bundles: false,
             request_sent_certificate_hashes_in_range: None,
             request_received_log_excluding_first_n: None,
             request_manager_values: false,
-            request_leader_timeout: false,
+            request_leader_timeout: None,
             request_fallback: false,
+            request_sent_certificate_hashes_by_heights: Vec::new(),
+            create_network_actions: false,
         }
     }
 
@@ -120,7 +134,7 @@ impl ChainInfoQuery {
     }
 
     pub fn with_owner_balance(mut self, owner: AccountOwner) -> Self {
-        self.request_owner_balance = Some(owner);
+        self.request_owner_balance = owner;
         self
     }
 
@@ -129,8 +143,8 @@ impl ChainInfoQuery {
         self
     }
 
-    pub fn with_sent_certificate_hashes_in_range(mut self, range: BlockHeightRange) -> Self {
-        self.request_sent_certificate_hashes_in_range = Some(range);
+    pub fn with_sent_certificate_hashes_by_heights(mut self, heights: Vec<BlockHeight>) -> Self {
+        self.request_sent_certificate_hashes_by_heights = heights;
         self
     }
 
@@ -144,13 +158,18 @@ impl ChainInfoQuery {
         self
     }
 
-    pub fn with_timeout(mut self) -> Self {
-        self.request_leader_timeout = true;
+    pub fn with_timeout(mut self, height: BlockHeight, round: Round) -> Self {
+        self.request_leader_timeout = Some((height, round));
         self
     }
 
     pub fn with_fallback(mut self) -> Self {
         self.request_fallback = true;
+        self
+    }
+
+    pub fn with_network_actions(mut self) -> Self {
+        self.create_network_actions = true;
         self
     }
 }
@@ -161,8 +180,7 @@ pub struct ChainInfo {
     /// The chain ID.
     pub chain_id: ChainId,
     /// The number identifying the current configuration.
-    #[debug(skip_if = Option::is_none)]
-    pub epoch: Option<Epoch>,
+    pub epoch: Epoch,
     /// The chain description.
     #[debug(skip_if = Option::is_none)]
     pub description: Option<ChainDescription>,
@@ -217,7 +235,17 @@ impl ChainInfo {
 #[cfg_attr(with_testing, derive(Eq, PartialEq))]
 pub struct ChainInfoResponse {
     pub info: Box<ChainInfo>,
-    pub signature: Option<Signature>,
+    pub signature: Option<ValidatorSignature>,
+}
+
+/// Information about shard allocation for a chain.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(with_testing, derive(Eq, PartialEq))]
+pub struct ShardInfo {
+    /// The shard ID that will process this chain.
+    pub shard_id: usize,
+    /// The total number of shards in the validator.
+    pub total_shards: usize,
 }
 
 /// An internal request between chains within a validator.
@@ -229,13 +257,13 @@ pub enum CrossChainRequest {
     UpdateRecipient {
         sender: ChainId,
         recipient: ChainId,
-        bundle_vecs: Vec<(Medium, Vec<(Epoch, MessageBundle)>)>,
+        bundles: Vec<(Epoch, MessageBundle)>,
     },
     /// Acknowledge the height of the highest confirmed blocks communicated with `UpdateRecipient`.
     ConfirmUpdatedRecipient {
         sender: ChainId,
         recipient: ChainId,
-        latest_heights: Vec<(Medium, BlockHeight)>,
+        latest_height: BlockHeight,
     },
 }
 
@@ -252,11 +280,9 @@ impl CrossChainRequest {
     /// Returns true if the cross-chain request has messages lower or equal than `height`.
     pub fn has_messages_lower_or_equal_than(&self, height: BlockHeight) -> bool {
         match self {
-            CrossChainRequest::UpdateRecipient { bundle_vecs, .. } => {
-                bundle_vecs.iter().any(|(_, bundles)| {
-                    debug_assert!(bundles.windows(2).all(|w| w[0].1.height <= w[1].1.height));
-                    matches!(bundles.first(), Some((_, h)) if h.height <= height)
-                })
+            CrossChainRequest::UpdateRecipient { bundles, .. } => {
+                debug_assert!(bundles.windows(2).all(|w| w[0].1.height <= w[1].1.height));
+                matches!(bundles.first(), Some((_, h)) if h.height <= height)
             }
             _ => false,
         }
@@ -265,7 +291,7 @@ impl CrossChainRequest {
 
 impl<C, S> From<&ChainStateView<C>> for ChainInfo
 where
-    C: Context<Extra = ChainRuntimeContext<S>> + Clone + Send + Sync + 'static,
+    C: Context<Extra = ChainRuntimeContext<S>> + Clone + 'static,
     ChainRuntimeContext<S>: ExecutionRuntimeContext,
 {
     fn from(view: &ChainStateView<C>) -> Self {
@@ -274,7 +300,7 @@ where
         ChainInfo {
             chain_id: view.chain_id(),
             epoch: *system_state.epoch.get(),
-            description: *system_state.description.get(),
+            description: system_state.description.get().clone(),
             manager: Box::new(ChainManagerInfo::from(&view.manager)),
             chain_balance: *system_state.balance.get(),
             block_hash: tip_state.block_hash,
@@ -292,37 +318,41 @@ where
 }
 
 impl ChainInfoResponse {
-    pub fn new(info: impl Into<ChainInfo>, key_pair: Option<&KeyPair>) -> Self {
+    pub fn new(info: impl Into<ChainInfo>, key_pair: Option<&ValidatorSecretKey>) -> Self {
         let info = Box::new(info.into());
-        let signature = key_pair.map(|kp| Signature::new(&*info, kp));
+        let signature = key_pair.map(|kp| ValidatorSignature::new(&*info, kp));
         Self { info, signature }
     }
 
     /// Signs the [`ChainInfo`] stored inside this [`ChainInfoResponse`] with the provided
-    /// [`KeyPair`].
-    pub fn sign(&mut self, key_pair: &KeyPair) {
-        self.signature = Some(Signature::new(&*self.info, key_pair));
+    /// [`ValidatorSecretKey`].
+    pub fn sign(&mut self, key_pair: &ValidatorSecretKey) {
+        self.signature = Some(ValidatorSignature::new(&*self.info, key_pair));
     }
 
-    pub fn check(&self, name: &ValidatorName) -> Result<(), CryptoError> {
-        Signature::check_optional_signature(self.signature.as_ref(), &*self.info, &name.0)
-    }
-
-    /// Returns the committee in the latest epoch.
-    pub fn latest_committee(&self) -> Option<&Committee> {
-        let committees = self.info.requested_committees.as_ref()?;
-        committees.get(&self.info.epoch?)
+    pub fn check(&self, public_key: ValidatorPublicKey) -> Result<(), CryptoError> {
+        match self.signature.as_ref() {
+            Some(sig) => sig.check(&*self.info, public_key),
+            None => Err(CryptoError::MissingValidatorSignature),
+        }
     }
 }
 
-impl<'de> BcsSignable<'de> for ChainInfo {}
+impl BcsSignable<'_> for ChainInfo {}
+
+/// Request for downloading certificates by heights.
+#[derive(Debug, Clone)]
+pub struct CertificatesByHeightRequest {
+    pub chain_id: ChainId,
+    pub heights: Vec<BlockHeight>,
+}
 
 /// The outcome of trying to commit a list of operations to the chain.
 #[derive(Debug)]
 pub enum ClientOutcome<T> {
     /// The operations were committed successfully.
     Committed(T),
-    /// We are not the round leader and cannot do anything. Try again at the specified time or
+    /// We are not the round leader and cannot do anything. Try again at the specified time
     /// or whenever the round or block height changes.
     WaitForTimeout(RoundTimeout),
 }
@@ -334,12 +364,22 @@ pub struct RoundTimeout {
     pub next_block_height: BlockHeight,
 }
 
+impl fmt::Display for RoundTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} at height {} times out at {}",
+            self.current_round, self.next_block_height, self.timestamp
+        )
+    }
+}
+
 impl<T> ClientOutcome<T> {
     #[cfg(with_testing)]
     pub fn unwrap(self) -> T {
         match self {
             ClientOutcome::Committed(t) => t,
-            ClientOutcome::WaitForTimeout(_) => panic!(),
+            ClientOutcome::WaitForTimeout(timeout) => panic!("unexpected timeout: {timeout}"),
         }
     }
 
@@ -360,9 +400,9 @@ impl<T> ClientOutcome<T> {
         }
     }
 
-    pub fn try_map<F, S>(self, f: F) -> Result<ClientOutcome<S>, ChainClientError>
+    pub fn try_map<F, S>(self, f: F) -> Result<ClientOutcome<S>, chain_client::Error>
     where
-        F: FnOnce(T) -> Result<S, ChainClientError>,
+        F: FnOnce(T) -> Result<S, chain_client::Error>,
     {
         match self {
             ClientOutcome::Committed(t) => Ok(ClientOutcome::Committed(f(t)?)),

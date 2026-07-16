@@ -16,7 +16,7 @@ use syn::{
 
 use crate::util::{Specialization, Specializations};
 
-/// Information on the  generic type parameter to use for the caller parameter, if present.
+/// Information on the generic type parameter to use for the caller parameter, if present.
 #[derive(Clone, Copy, Debug)]
 pub struct CallerTypeParameter<'input> {
     caller: &'input Ident,
@@ -30,8 +30,7 @@ impl<'input> CallerTypeParameter<'input> {
 
         generics
             .type_params()
-            .filter_map(|parameter| Self::try_from_parameter(parameter, &where_bounds))
-            .next()
+            .find_map(|parameter| Self::try_from_parameter(parameter, &where_bounds))
     }
 
     /// Parses the bounds present in an optional `where_clause`.
@@ -100,8 +99,7 @@ impl<'input> CallerTypeParameter<'input> {
 
         let instance_bound_path_segment = bounds
             .filter_map(Self::extract_trait_bound_path)
-            .filter_map(Self::extract_instance_bound_path_segment)
-            .next()?;
+            .find_map(Self::extract_instance_bound_path_segment)?;
 
         let user_data =
             Self::extract_instance_bound_arguments(&instance_bound_path_segment.arguments)
@@ -254,7 +252,7 @@ impl<'input> CallerTypeParameter<'input> {
             .apply_to_type(target_type);
     }
 
-    /// Builds the [`Specializatons`] instance to replace the [`CallerTypeParameter`] with the
+    /// Builds the [`Specializations`] instance to replace the [`CallerTypeParameter`] with the
     /// concrete `caller_type`.
     fn build_specializations(&self, caller_type: Type) -> Specializations {
         Specializations::from_iter(Some(Specialization::new(self.caller.clone(), caller_type)))

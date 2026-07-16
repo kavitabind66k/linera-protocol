@@ -11,10 +11,16 @@ license.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[lints]
+workspace = true
+
 [features]
+revm = ["linera-execution/revm"]
 test = ["linera-execution/test", "linera-views/test"]
 wasmer = ["linera-execution/wasmer"]
 wasmtime = ["linera-execution/wasmtime"]
+scylladb = ["linera-views/scylladb"]
+dynamodb = ["linera-views/dynamodb"]
 metrics = [
     "linera-base/metrics",
     "linera-chain/metrics",
@@ -31,18 +37,24 @@ web = [
 [dependencies]
 async-trait.workspace = true
 bcs.workspace = true
-dashmap.workspace = true
+cfg-if.workspace = true
 futures.workspace = true
+itertools.workspace = true
 linera-base.workspace = true
 linera-chain.workspace = true
 linera-execution.workspace = true
 linera-views.workspace = true
+papaya.workspace = true
 prometheus.workspace = true
 serde.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
 linera-storage = { path = ".", default-features = false, features = ["test"] }
+test-case.workspace = true
+test-log = { workspace = true, features = ["trace"] }
+tokio.workspace = true
 
 [build-dependencies]
 cfg_aliases.workspace = true

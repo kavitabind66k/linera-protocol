@@ -44,11 +44,11 @@ impl SummaryOptions {
     pub fn pr_number(&self) -> Option<u64> {
         match self.command {
             Command::Local { pr } => Some(pr),
-            Command::Ci { .. } => None,
+            Command::Ci => None,
         }
     }
 
     pub fn workflows(&self) -> HashSet<String> {
-        self.workflows.split(',').map(|s| s.to_string()).collect()
+        self.workflows.split(',').map(str::to_string).collect()
     }
 }

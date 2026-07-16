@@ -4,25 +4,24 @@
 //! This module provides network abstractions and the data schemas for remote procedure
 //! calls (RPCs) in the Linera protocol.
 
-#![deny(clippy::large_futures)]
 // `tracing::instrument` is not compatible with this nightly Clippy lint
 #![allow(unknown_lints)]
-#![allow(clippy::blocks_in_conditions)]
 
 pub mod config;
-pub mod mass_client;
 pub mod node_provider;
 
 pub mod client;
 
+mod cross_chain_message_queue;
 mod message;
 #[cfg(with_simple_network)]
 pub mod simple;
 
 pub mod grpc;
 
-pub use message::RpcMessage;
-pub use node_provider::NodeOptions;
+pub use client::Client;
+pub use message::{RpcMessage, ShardInfo};
+pub use node_provider::{NodeOptions, NodeProvider};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(with_testing, derive(Eq, PartialEq))]

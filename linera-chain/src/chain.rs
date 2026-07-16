@@ -1,55 +1,50 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(with_metrics)]
-use std::sync::LazyLock;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
-use async_graphql::SimpleObject;
-use futures::stream::{self, StreamExt, TryStreamExt};
+use allocative::Allocative;
 use linera_base::{
-    crypto::CryptoHash,
+    crypto::{CryptoHash, ValidatorPublicKey},
     data_types::{
-        Amount, ArithmeticError, Blob, BlockHeight, OracleResponse, Timestamp,
-        UserApplicationDescription,
+        ApplicationDescription, ApplicationPermissions, ArithmeticError, Blob, BlockHeight, Epoch,
+        OracleResponse, Timestamp,
     },
     ensure,
-    identifiers::{
-        BlobId, ChainId, ChannelName, Destination, GenericApplicationId, MessageId, Owner,
-        StreamId, UserApplicationId,
-    },
+    identifiers::{AccountOwner, ApplicationId, BlobType, ChainId, StreamId},
+    ownership::ChainOwnership,
 };
 use linera_execution::{
-    committee::ValidatorName, system::OpenChainConfig, ExecutionOutcome, ExecutionRuntimeContext,
-    ExecutionStateView, Message, MessageContext, Operation, OperationContext, Query, QueryContext,
-    RawExecutionOutcome, RawOutgoingMessage, ResourceController, ResourceTracker, Response,
-    ServiceRuntimeEndpoint, TransactionTracker,
+    committee::Committee, system::EPOCH_STREAM_NAME, ExecutionRuntimeContext, ExecutionStateView,
+    Message, Operation, OutgoingMessage, Query, QueryContext, QueryOutcome, ResourceController,
+    ResourceTracker, ServiceRuntimeEndpoint, TransactionTracker,
 };
 use linera_views::{
     context::Context,
     log_view::LogView,
     map_view::MapView,
-    queue_view::QueueView,
-    reentrant_collection_view::ReentrantCollectionView,
+    reentrant_collection_view::{ReadGuardedView, ReentrantCollectionView},
     register_view::RegisterView,
-    set_view::SetView,
-    views::{ClonableView, CryptoHashView, RootView, View},
+    views::{ClonableView, RootView, View},
 };
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
 
 use crate::{
+    block::{Block, ConfirmedBlock},
+    block_tracker::BlockExecutionTracker,
     data_types::{
-        Block, BlockExecutionOutcome, ChainAndHeight, ChannelFullName, EventRecord, IncomingBundle,
-        MessageAction, MessageBundle, Origin, OutgoingMessage, PostedMessage, Target, Transaction,
+        BlockExecutionOutcome, ChainAndHeight, IncomingBundle, MessageBundle, ProposedBlock,
+        Transaction,
     },
-    inbox::{Cursor, InboxError, InboxStateView},
+    inbox::{InboxError, InboxStateView},
     manager::ChainManager,
     outbox::OutboxStateView,
-    types::ValidatedBlockCertificate,
-    ChainError, ChainExecutionContext, ExecutionResultExt,
+    pending_blobs::PendingBlobsView,
+    ChainError, ChainExecutionContext, ExecutionError, ExecutionResultExt,
 };
 
 #[cfg(test)]
@@ -57,137 +52,158 @@ use crate::{
 mod chain_tests;
 
 #[cfg(with_metrics)]
-use {
-    linera_base::prometheus_util::{
-        bucket_interval, bucket_latencies, register_histogram_vec, register_int_counter_vec,
-        MeasureLatency,
-    },
-    prometheus::{HistogramVec, IntCounterVec},
-};
+use linera_base::prometheus_util::MeasureLatency;
 
 #[cfg(with_metrics)]
-static NUM_BLOCKS_EXECUTED: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec("num_blocks_executed", "Number of blocks executed", &[])
-});
+pub(crate) mod metrics {
+    use std::sync::LazyLock;
 
-#[cfg(with_metrics)]
-static BLOCK_EXECUTION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "block_execution_latency",
-        "Block execution latency",
-        &[],
-        bucket_latencies(50.0),
-    )
-});
+    use linera_base::prometheus_util::{
+        exponential_bucket_interval, exponential_bucket_latencies, register_histogram_vec,
+        register_int_counter_vec,
+    };
+    use linera_execution::ResourceTracker;
+    use prometheus::{HistogramVec, IntCounterVec};
 
-#[cfg(with_metrics)]
-static MESSAGE_EXECUTION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "message_execution_latency",
-        "Message execution latency",
-        &[],
-        bucket_latencies(2.5),
-    )
-});
+    pub static NUM_BLOCKS_EXECUTED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec("num_blocks_executed", "Number of blocks executed", &[])
+    });
 
-#[cfg(with_metrics)]
-static OPERATION_EXECUTION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "operation_execution_latency",
-        "Operation execution latency",
-        &[],
-        bucket_latencies(2.5),
-    )
-});
+    pub static BLOCK_EXECUTION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "block_execution_latency",
+            "Block execution latency",
+            &[],
+            exponential_bucket_interval(50.0_f64, 10_000_000.0),
+        )
+    });
 
-#[cfg(with_metrics)]
-static WASM_FUEL_USED_PER_BLOCK: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "wasm_fuel_used_per_block",
-        "Wasm fuel used per block",
-        &[],
-        bucket_interval(10.0, 500_000.0),
-    )
-});
+    #[cfg(with_metrics)]
+    pub static MESSAGE_EXECUTION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "message_execution_latency",
+            "Message execution latency",
+            &[],
+            exponential_bucket_interval(0.1_f64, 50_000.0),
+        )
+    });
 
-#[cfg(with_metrics)]
-static WASM_NUM_READS_PER_BLOCK: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "wasm_num_reads_per_block",
-        "Wasm number of reads per block",
-        &[],
-        bucket_interval(0.1, 100.0),
-    )
-});
+    pub static OPERATION_EXECUTION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "operation_execution_latency",
+            "Operation execution latency",
+            &[],
+            exponential_bucket_interval(0.1_f64, 50_000.0),
+        )
+    });
 
-#[cfg(with_metrics)]
-static WASM_BYTES_READ_PER_BLOCK: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "wasm_bytes_read_per_block",
-        "Wasm number of bytes read per block",
-        &[],
-        bucket_interval(0.1, 10_000_000.0),
-    )
-});
+    pub static WASM_FUEL_USED_PER_BLOCK: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "wasm_fuel_used_per_block",
+            "Wasm fuel used per block",
+            &[],
+            exponential_bucket_interval(10.0, 1_000_000.0),
+        )
+    });
 
-#[cfg(with_metrics)]
-static WASM_BYTES_WRITTEN_PER_BLOCK: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "wasm_bytes_written_per_block",
-        "Wasm number of bytes written per block",
-        &[],
-        bucket_interval(0.1, 10_000_000.0),
-    )
-});
+    pub static EVM_FUEL_USED_PER_BLOCK: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "evm_fuel_used_per_block",
+            "EVM fuel used per block",
+            &[],
+            exponential_bucket_interval(10.0, 1_000_000.0),
+        )
+    });
 
-#[cfg(with_metrics)]
-static STATE_HASH_COMPUTATION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "state_hash_computation_latency",
-        "Time to recompute the state hash",
-        &[],
-        bucket_latencies(5.0),
-    )
-});
+    pub static VM_NUM_READS_PER_BLOCK: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "vm_num_reads_per_block",
+            "VM number of reads per block",
+            &[],
+            exponential_bucket_interval(0.1, 100.0),
+        )
+    });
 
-/// The BCS-serialized size of an empty `ExecutedBlock`.
-const EMPTY_EXECUTED_BLOCK_SIZE: usize = 91;
+    pub static VM_BYTES_READ_PER_BLOCK: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "vm_bytes_read_per_block",
+            "VM number of bytes read per block",
+            &[],
+            exponential_bucket_interval(0.1, 10_000_000.0),
+        )
+    });
 
-/// An origin, cursor and timestamp of a unskippable bundle in our inbox.
-#[derive(Debug, Clone, Serialize, Deserialize, async_graphql::SimpleObject)]
-pub struct TimestampedBundleInInbox {
-    /// The origin and cursor of the bundle.
-    pub entry: BundleInInbox,
-    /// The timestamp when the bundle was added to the inbox.
-    pub seen: Timestamp,
-}
+    pub static VM_BYTES_WRITTEN_PER_BLOCK: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "vm_bytes_written_per_block",
+            "VM number of bytes written per block",
+            &[],
+            exponential_bucket_interval(0.1, 10_000_000.0),
+        )
+    });
 
-/// An origin and cursor of a unskippable bundle that is no longer in our inbox.
-#[derive(
-    Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, async_graphql::SimpleObject,
-)]
-pub struct BundleInInbox {
-    /// The origin from which we received the bundle.
-    pub origin: Origin,
-    /// The cursor of the bundle in the inbox.
-    pub cursor: Cursor,
-}
+    pub static STATE_HASH_COMPUTATION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "state_hash_computation_latency",
+            "Time to recompute the state hash",
+            &[],
+            exponential_bucket_latencies(500.0),
+        )
+    });
 
-impl BundleInInbox {
-    fn new(origin: Origin, bundle: &MessageBundle) -> Self {
-        BundleInInbox {
-            cursor: Cursor::from(bundle),
-            origin,
-        }
+    pub static NUM_INBOXES: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "num_inboxes",
+            "Number of inboxes",
+            &[],
+            exponential_bucket_interval(1.0, 10_000.0),
+        )
+    });
+
+    pub static NUM_OUTBOXES: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "num_outboxes",
+            "Number of outboxes",
+            &[],
+            exponential_bucket_interval(1.0, 10_000.0),
+        )
+    });
+
+    /// Tracks block execution metrics in Prometheus.
+    pub(crate) fn track_block_metrics(tracker: &ResourceTracker) {
+        NUM_BLOCKS_EXECUTED.with_label_values(&[]).inc();
+        WASM_FUEL_USED_PER_BLOCK
+            .with_label_values(&[])
+            .observe(tracker.wasm_fuel as f64);
+        EVM_FUEL_USED_PER_BLOCK
+            .with_label_values(&[])
+            .observe(tracker.evm_fuel as f64);
+        VM_NUM_READS_PER_BLOCK
+            .with_label_values(&[])
+            .observe(tracker.read_operations as f64);
+        VM_BYTES_READ_PER_BLOCK
+            .with_label_values(&[])
+            .observe(tracker.bytes_read as f64);
+        VM_BYTES_WRITTEN_PER_BLOCK
+            .with_label_values(&[])
+            .observe(tracker.bytes_written as f64);
     }
 }
 
+/// The BCS-serialized size of an empty [`Block`].
+pub(crate) const EMPTY_BLOCK_SIZE: usize = 94;
+
 /// A view accessing the state of a chain.
-#[derive(Debug, RootView, ClonableView, SimpleObject)]
-#[graphql(cache_control(no_cache))]
+#[cfg_attr(
+    with_graphql,
+    derive(async_graphql::SimpleObject),
+    graphql(cache_control(no_cache))
+)]
+#[derive(Debug, RootView, ClonableView, Allocative)]
+#[allocative(bound = "C")]
 pub struct ChainStateView<C>
 where
-    C: Clone + Context + Send + Sync + 'static,
+    C: Clone + Context + 'static,
 {
     /// Execution state, including system and user applications.
     pub execution_state: ExecutionStateView<C>,
@@ -200,10 +216,10 @@ where
     /// Consensus state.
     pub manager: ChainManager<C>,
     /// Pending validated block that is still missing blobs.
-    #[graphql(skip)]
-    pub pending_validated_block: RegisterView<C, Option<ValidatedBlockCertificate>>,
     /// The incomplete set of blobs for the pending validated block.
-    pub pending_validated_blobs: MapView<C, BlobId, Option<Blob>>,
+    pub pending_validated_blobs: PendingBlobsView<C>,
+    /// The incomplete sets of blobs for upcoming proposals.
+    pub pending_proposed_blobs: ReentrantCollectionView<C, AccountOwner, PendingBlobsView<C>>,
 
     /// Hashes of all certified blocks for this sender.
     /// This ends with `block_hash` and has length `usize::from(next_block_height)`.
@@ -211,25 +227,28 @@ where
     /// Sender chain and height of all certified blocks known as a receiver (local ordering).
     pub received_log: LogView<C, ChainAndHeight>,
     /// The number of `received_log` entries we have synchronized, for each validator.
-    pub received_certificate_trackers: RegisterView<C, HashMap<ValidatorName, u64>>,
+    pub received_certificate_trackers: RegisterView<C, HashMap<ValidatorPublicKey, u64>>,
 
     /// Mailboxes used to receive messages indexed by their origin.
-    pub inboxes: ReentrantCollectionView<C, Origin, InboxStateView<C>>,
-    /// A queue of unskippable bundles, with the timestamp when we added them to the inbox.
-    pub unskippable_bundles: QueueView<C, TimestampedBundleInInbox>,
-    /// Unskippable bundles that have been removed but are still in the queue.
-    pub removed_unskippable_bundles: SetView<C, BundleInInbox>,
+    pub inboxes: ReentrantCollectionView<C, ChainId, InboxStateView<C>>,
     /// Mailboxes used to send messages, indexed by their target.
-    pub outboxes: ReentrantCollectionView<C, Target, OutboxStateView<C>>,
+    pub outboxes: ReentrantCollectionView<C, ChainId, OutboxStateView<C>>,
+    /// The indices of next events we expect to see per stream (could be ahead of the last
+    /// executed block in sparse chains).
+    pub next_expected_events: MapView<C, StreamId, u32>,
     /// Number of outgoing messages in flight for each block height.
     /// We use a `RegisterView` to prioritize speed for small maps.
     pub outbox_counters: RegisterView<C, BTreeMap<BlockHeight, u32>>,
-    /// Channels able to multicast messages to subscribers.
-    pub channels: ReentrantCollectionView<C, ChannelFullName, ChannelStateView<C>>,
+    /// Outboxes with at least one pending message. This allows us to avoid loading all outboxes.
+    pub nonempty_outboxes: RegisterView<C, BTreeSet<ChainId>>,
+
+    /// Blocks that have been verified but not executed yet, and that may not be contiguous.
+    pub preprocessed_blocks: MapView<C, BlockHeight, CryptoHash>,
 }
 
 /// Block-chaining state.
-#[derive(Debug, Default, Clone, Eq, PartialEq, Serialize, Deserialize, SimpleObject)]
+#[cfg_attr(with_graphql, derive(async_graphql::SimpleObject))]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Serialize, Deserialize, Allocative)]
 pub struct ChainTipState {
     /// Hash of the latest certified block in this chain, if any.
     pub block_hash: Option<CryptoHash>,
@@ -246,7 +265,7 @@ pub struct ChainTipState {
 impl ChainTipState {
     /// Checks that the proposed block is suitable, i.e. at the expected height and with the
     /// expected parent.
-    pub fn verify_block_chaining(&self, new_block: &Block) -> Result<(), ChainError> {
+    pub fn verify_block_chaining(&self, new_block: &ProposedBlock) -> Result<(), ChainError> {
         ensure!(
             new_block.height == self.next_block_height,
             ChainError::UnexpectedBlockHeight {
@@ -273,32 +292,44 @@ impl ChainTipState {
         Ok(self.next_block_height > height)
     }
 
-    /// Returns `true` if the next block will be the first, i.e. the chain doesn't have any blocks.
-    pub fn is_first_block(&self) -> bool {
-        self.next_block_height == BlockHeight::ZERO
-    }
-
     /// Checks if the measurement counters would be valid.
-    pub fn verify_counters(
-        &self,
-        new_block: &Block,
-        outcome: &BlockExecutionOutcome,
+    pub fn update_counters(
+        &mut self,
+        transactions: &[Transaction],
+        messages: &[Vec<OutgoingMessage>],
     ) -> Result<(), ChainError> {
-        let num_incoming_bundles = u32::try_from(new_block.incoming_bundles.len())
-            .map_err(|_| ArithmeticError::Overflow)?;
-        self.num_incoming_bundles
+        let mut num_incoming_bundles = 0u32;
+        let mut num_operations = 0u32;
+
+        for transaction in transactions {
+            match transaction {
+                Transaction::ReceiveMessages(_) => {
+                    num_incoming_bundles = num_incoming_bundles
+                        .checked_add(1)
+                        .ok_or(ArithmeticError::Overflow)?;
+                }
+                Transaction::ExecuteOperation(_) => {
+                    num_operations = num_operations
+                        .checked_add(1)
+                        .ok_or(ArithmeticError::Overflow)?;
+                }
+            }
+        }
+
+        self.num_incoming_bundles = self
+            .num_incoming_bundles
             .checked_add(num_incoming_bundles)
             .ok_or(ArithmeticError::Overflow)?;
 
-        let num_operations =
-            u32::try_from(new_block.operations.len()).map_err(|_| ArithmeticError::Overflow)?;
-        self.num_operations
+        self.num_operations = self
+            .num_operations
             .checked_add(num_operations)
             .ok_or(ArithmeticError::Overflow)?;
 
-        let num_outgoing_messages =
-            u32::try_from(outcome.messages.len()).map_err(|_| ArithmeticError::Overflow)?;
-        self.num_outgoing_messages
+        let num_outgoing_messages = u32::try_from(messages.iter().map(Vec::len).sum::<usize>())
+            .map_err(|_| ArithmeticError::Overflow)?;
+        self.num_outgoing_messages = self
+            .num_outgoing_messages
             .checked_add(num_outgoing_messages)
             .ok_or(ArithmeticError::Overflow)?;
 
@@ -306,21 +337,9 @@ impl ChainTipState {
     }
 }
 
-/// The state of a channel followed by subscribers.
-#[derive(Debug, ClonableView, View, SimpleObject)]
-pub struct ChannelStateView<C>
-where
-    C: Context + Send + Sync,
-{
-    /// The current subscribers.
-    pub subscribers: SetView<C, ChainId>,
-    /// The block heights so far, to be sent to future subscribers.
-    pub block_heights: LogView<C, BlockHeight>,
-}
-
 impl<C> ChainStateView<C>
 where
-    C: Context + Clone + Send + Sync + 'static,
+    C: Context + Clone + 'static,
     C::Extra: ExecutionRuntimeContext,
 {
     /// Returns the [`ChainId`] of the chain this [`ChainStateView`] represents.
@@ -328,12 +347,15 @@ where
         self.context().extra().chain_id()
     }
 
+    #[instrument(skip_all, fields(
+        chain_id = %self.chain_id(),
+    ))]
     pub async fn query_application(
         &mut self,
         local_time: Timestamp,
         query: Query,
         service_runtime_endpoint: Option<&mut ServiceRuntimeEndpoint>,
-    ) -> Result<Response, ChainError> {
+    ) -> Result<QueryOutcome, ChainError> {
         let context = QueryContext {
             chain_id: self.chain_id(),
             next_block_height: self.tip_state.get().next_block_height,
@@ -345,21 +367,29 @@ where
             .with_execution_context(ChainExecutionContext::Query)
     }
 
+    #[instrument(skip_all, fields(
+        chain_id = %self.chain_id(),
+        application_id = %application_id
+    ))]
     pub async fn describe_application(
         &mut self,
-        application_id: UserApplicationId,
-    ) -> Result<UserApplicationDescription, ChainError> {
+        application_id: ApplicationId,
+    ) -> Result<ApplicationDescription, ChainError> {
         self.execution_state
             .system
-            .registry
-            .describe_application(application_id)
+            .describe_application(application_id, &mut TransactionTracker::default())
             .await
             .with_execution_context(ChainExecutionContext::DescribeApplication)
     }
 
+    #[instrument(skip_all, fields(
+        chain_id = %self.chain_id(),
+        target = %target,
+        height = %height
+    ))]
     pub async fn mark_messages_as_received(
         &mut self,
-        target: &Target,
+        target: &ChainId,
         height: BlockHeight,
     ) -> Result<bool, ChainError> {
         let mut outbox = self.outboxes.try_load_entry_mut(target).await?;
@@ -372,18 +402,26 @@ where
                 .outbox_counters
                 .get_mut()
                 .get_mut(&update)
-                .expect("message counter should be present");
-            *counter = counter
-                .checked_sub(1)
-                .expect("message counter should not underflow");
+                .ok_or_else(|| {
+                    ChainError::InternalError("message counter should be present".into())
+                })?;
+            *counter = counter.checked_sub(1).ok_or(ArithmeticError::Underflow)?;
             if *counter == 0 {
                 // Important for the test in `all_messages_delivered_up_to`.
                 self.outbox_counters.get_mut().remove(&update);
             }
         }
         if outbox.queue.count() == 0 {
-            self.outboxes.remove_entry(target)?;
+            self.nonempty_outboxes.get_mut().remove(target);
+            // If the outbox is empty and not ahead of the executed blocks, remove it.
+            if *outbox.next_height_to_schedule.get() <= self.tip_state.get().next_block_height {
+                self.outboxes.remove_entry(target)?;
+            }
         }
+        #[cfg(with_metrics)]
+        metrics::NUM_OUTBOXES
+            .with_label_values(&[])
+            .observe(self.outboxes.count().await? as f64);
         Ok(true)
     }
 
@@ -407,56 +445,58 @@ where
         self.execution_state.system.is_active()
     }
 
-    /// Returns whether this chain has been closed.
-    pub fn is_closed(&self) -> bool {
-        *self.execution_state.system.closed.get()
-    }
-
-    /// Invariant for the states of active chains.
-    pub fn ensure_is_active(&self) -> Result<(), ChainError> {
-        if self.is_active() {
-            Ok(())
-        } else {
-            Err(ChainError::InactiveChain(self.chain_id()))
-        }
-    }
-
-    /// Verifies that this chain is up-to-date and all the messages executed ahead of time
-    /// have been properly received by now.
-    pub async fn validate_incoming_bundles(&self) -> Result<(), ChainError> {
+    /// Initializes the chain if it is not active yet.
+    pub async fn initialize_if_needed(&mut self, local_time: Timestamp) -> Result<(), ChainError> {
         let chain_id = self.chain_id();
-        let pairs = self.inboxes.try_load_all_entries().await?;
-        let max_stream_queries = self.context().max_stream_queries();
-        let stream = stream::iter(pairs)
-            .map(|(origin, inbox)| async move {
-                if let Some(bundle) = inbox.removed_bundles.front().await? {
-                    return Err(ChainError::MissingCrossChainUpdate {
-                        chain_id,
-                        origin: origin.into(),
-                        height: bundle.height,
-                    });
-                }
-                Ok::<(), ChainError>(())
-            })
-            .buffer_unordered(max_stream_queries);
-        stream.try_collect::<Vec<_>>().await?;
+        // Initialize ourselves.
+        if self
+            .execution_state
+            .system
+            .initialize_chain(chain_id)
+            .await
+            .with_execution_context(ChainExecutionContext::Block)?
+        {
+            // The chain was already initialized.
+            return Ok(());
+        }
+        // Recompute the state hash.
+        let hash = self.execution_state.crypto_hash_mut().await?;
+        self.execution_state_hash.set(Some(hash));
+        let maybe_committee = self.execution_state.system.current_committee().into_iter();
+        // Last, reset the consensus state based on the current ownership.
+        self.manager.reset(
+            self.execution_state.system.ownership.get().clone(),
+            BlockHeight(0),
+            local_time,
+            maybe_committee.flat_map(|(_, committee)| committee.account_keys_and_weights()),
+        )?;
         Ok(())
     }
 
     pub async fn next_block_height_to_receive(
         &self,
-        origin: &Origin,
+        origin: &ChainId,
     ) -> Result<BlockHeight, ChainError> {
         let inbox = self.inboxes.try_load_entry(origin).await?;
         match inbox {
             Some(inbox) => inbox.next_block_height_to_receive(),
-            None => Ok(BlockHeight::from(0)),
+            None => Ok(BlockHeight::ZERO),
         }
+    }
+
+    /// Returns the height of the highest block we have, plus one. Includes preprocessed blocks.
+    ///
+    /// The "+ 1" is so that it can be used in the same places as `next_block_height`.
+    pub async fn next_height_to_preprocess(&self) -> Result<BlockHeight, ChainError> {
+        if let Some(height) = self.preprocessed_blocks.indices().await?.last() {
+            return Ok(height.saturating_add(BlockHeight(1)));
+        }
+        Ok(self.tip_state.get().next_block_height)
     }
 
     pub async fn last_anticipated_block_height(
         &self,
-        origin: &Origin,
+        origin: &ChainId,
     ) -> Result<Option<BlockHeight>, ChainError> {
         let inbox = self.inboxes.try_load_entry(origin).await?;
         match inbox {
@@ -474,13 +514,18 @@ where
     /// round timeouts.
     ///
     /// Returns `true` if incoming `Subscribe` messages created new outbox entries.
+    #[instrument(skip_all, fields(
+        chain_id = %self.chain_id(),
+        origin = %origin,
+        bundle_height = %bundle.height
+    ))]
     pub async fn receive_message_bundle(
         &mut self,
-        origin: &Origin,
+        origin: &ChainId,
         bundle: MessageBundle,
         local_time: Timestamp,
         add_to_received_log: bool,
-    ) -> Result<bool, ChainError> {
+    ) -> Result<(), ChainError> {
         assert!(!bundle.messages.is_empty());
         let chain_id = self.chain_id();
         tracing::trace!(
@@ -488,65 +533,51 @@ where
             bundle.height,
         );
         let chain_and_height = ChainAndHeight {
-            chain_id: origin.sender,
+            chain_id: *origin,
             height: bundle.height,
         };
-        let mut subscribe_names_and_ids = Vec::new();
-        let mut unsubscribe_names_and_ids = Vec::new();
 
-        // Handle immediate messages.
-        for posted_message in &bundle.messages {
-            if let Some(config) = posted_message.message.matches_open_chain() {
-                if self.execution_state.system.description.get().is_none() {
-                    let message_id = chain_and_height.to_message_id(posted_message.index);
-                    self.execute_init_message(message_id, config, bundle.timestamp, local_time)
-                        .await?;
-                }
-            } else if let Some((id, subscription)) = posted_message.message.matches_subscribe() {
-                subscribe_names_and_ids.push((subscription.name.clone(), *id));
-            }
-            if let Some((id, subscription)) = posted_message.message.matches_unsubscribe() {
-                unsubscribe_names_and_ids.push((subscription.name.clone(), *id));
+        match self.initialize_if_needed(local_time).await {
+            Ok(_) => (),
+            // if the only issue was that we couldn't initialize the chain because of a
+            // missing chain description blob, we might still want to update the inbox
+            Err(ChainError::ExecutionError(exec_err, _))
+                if matches!(*exec_err, ExecutionError::BlobsNotFound(ref blobs)
+                if blobs.iter().all(|blob_id| {
+                    blob_id.blob_type == BlobType::ChainDescription && blob_id.hash == chain_id.0
+                })) => {}
+            err => {
+                return err;
             }
         }
-        self.process_unsubscribes(unsubscribe_names_and_ids, GenericApplicationId::System)
-            .await?;
-        let new_outbox_entries = self
-            .process_subscribes(subscribe_names_and_ids, GenericApplicationId::System)
-            .await?;
 
-        if bundle.goes_to_inbox() {
-            // Process the inbox bundle and update the inbox state.
-            let mut inbox = self.inboxes.try_load_entry_mut(origin).await?;
-            let entry = BundleInInbox::new(origin.clone(), &bundle);
-            let skippable = bundle.is_skippable();
-            let newly_added = inbox
-                .add_bundle(bundle)
-                .await
-                .map_err(|error| match error {
-                    InboxError::ViewError(error) => ChainError::ViewError(error),
-                    error => ChainError::InternalError(format!(
-                        "while processing messages in certified block: {error}"
-                    )),
-                })?;
-            if newly_added && !skippable {
-                let seen = local_time;
-                self.unskippable_bundles
-                    .push_back(TimestampedBundleInInbox { entry, seen });
-            }
-        }
+        // Process the inbox bundle and update the inbox state.
+        let mut inbox = self.inboxes.try_load_entry_mut(origin).await?;
+        #[cfg(with_metrics)]
+        metrics::NUM_INBOXES
+            .with_label_values(&[])
+            .observe(self.inboxes.count().await? as f64);
+        inbox
+            .add_bundle(bundle)
+            .await
+            .map_err(|error| match error {
+                InboxError::ViewError(error) => ChainError::ViewError(error),
+                error => ChainError::InternalError(format!(
+                    "while processing messages in certified block: {error}"
+                )),
+            })?;
 
         // Remember the certificate for future validator/client synchronizations.
         if add_to_received_log {
             self.received_log.push(chain_and_height);
         }
-        Ok(new_outbox_entries)
+        Ok(())
     }
 
     /// Updates the `received_log` trackers.
     pub fn update_received_certificate_trackers(
         &mut self,
-        new_trackers: BTreeMap<ValidatorName, u64>,
+        new_trackers: BTreeMap<ValidatorPublicKey, u64>,
     ) {
         for (name, tracker) in new_trackers {
             self.received_certificate_trackers
@@ -563,688 +594,601 @@ where
         }
     }
 
-    pub async fn execute_init_message(
-        &mut self,
-        message_id: MessageId,
-        config: &OpenChainConfig,
-        timestamp: Timestamp,
-        local_time: Timestamp,
-    ) -> Result<bool, ChainError> {
-        // Initialize ourself.
+    pub fn current_committee(&self) -> Result<(Epoch, &Committee), ChainError> {
         self.execution_state
             .system
-            .initialize_chain(message_id, timestamp, config.clone());
-        // Recompute the state hash.
-        let hash = self.execution_state.crypto_hash().await?;
-        self.execution_state_hash.set(Some(hash));
-        let maybe_committee = self.execution_state.system.current_committee().into_iter();
-        // Last, reset the consensus state based on the current ownership.
-        self.manager.reset(
-            self.execution_state.system.ownership.get().clone(),
-            BlockHeight(0),
-            local_time,
-            maybe_committee.flat_map(|(_, committee)| committee.keys_and_weights()),
-        )?;
-        Ok(true)
+            .current_committee()
+            .ok_or_else(|| ChainError::InactiveChain(self.chain_id()))
+    }
+
+    pub fn ownership(&self) -> &ChainOwnership {
+        self.execution_state.system.ownership.get()
     }
 
     /// Removes the incoming message bundles in the block from the inboxes.
-    pub async fn remove_bundles_from_inboxes(&mut self, block: &Block) -> Result<(), ChainError> {
+    ///
+    /// If `must_be_present` is `true`, an error is returned if any of the bundles have not been
+    /// added to the inbox yet. So this should be `true` if the bundles are in a block _proposal_,
+    /// and `false` if the block is already confirmed.
+    #[instrument(skip_all, fields(
+        chain_id = %self.chain_id(),
+    ))]
+    pub async fn remove_bundles_from_inboxes(
+        &mut self,
+        timestamp: Timestamp,
+        must_be_present: bool,
+        incoming_bundles: impl IntoIterator<Item = &IncomingBundle>,
+    ) -> Result<(), ChainError> {
         let chain_id = self.chain_id();
         let mut bundles_by_origin: BTreeMap<_, Vec<&MessageBundle>> = Default::default();
-        for IncomingBundle { bundle, origin, .. } in &block.incoming_bundles {
+        for IncomingBundle { bundle, origin, .. } in incoming_bundles {
             ensure!(
-                bundle.timestamp <= block.timestamp,
+                bundle.timestamp <= timestamp,
                 ChainError::IncorrectBundleTimestamp {
                     chain_id,
                     bundle_timestamp: bundle.timestamp,
-                    block_timestamp: block.timestamp,
+                    block_timestamp: timestamp,
                 }
             );
-            let bundles = bundles_by_origin.entry(origin).or_default();
+            let bundles = bundles_by_origin.entry(*origin).or_default();
             bundles.push(bundle);
         }
-        let origins = bundles_by_origin.keys().copied();
-        let inboxes = self.inboxes.try_load_entries_mut(origins).await?;
-        let mut removed_unskippable = HashSet::new();
+        let origins = bundles_by_origin.keys().copied().collect::<Vec<_>>();
+        let inboxes = self.inboxes.try_load_entries_mut(&origins).await?;
         for ((origin, bundles), mut inbox) in bundles_by_origin.into_iter().zip(inboxes) {
             tracing::trace!(
-                "Removing {:?} from {chain_id:.8}'s inbox for {origin:}",
+                "Removing [{}] from {chain_id:.8}'s inbox for {origin:}",
                 bundles
                     .iter()
-                    .map(|bundle| bundle.height)
+                    .map(|bundle| bundle.height.to_string())
                     .collect::<Vec<_>>()
+                    .join(", ")
             );
             for bundle in bundles {
                 // Mark the message as processed in the inbox.
                 let was_present = inbox
                     .remove_bundle(bundle)
                     .await
-                    .map_err(|error| ChainError::from((chain_id, origin.clone(), error)))?;
-                if was_present && !bundle.is_skippable() {
-                    removed_unskippable.insert(BundleInInbox::new(origin.clone(), bundle));
-                }
-            }
-        }
-        if !removed_unskippable.is_empty() {
-            // Delete all removed bundles from the front of the unskippable queue.
-            let maybe_front = self.unskippable_bundles.front().await?;
-            if maybe_front.is_some_and(|ts_entry| removed_unskippable.remove(&ts_entry.entry)) {
-                self.unskippable_bundles.delete_front();
-                while let Some(ts_entry) = self.unskippable_bundles.front().await? {
-                    if !removed_unskippable.remove(&ts_entry.entry) {
-                        if !self
-                            .removed_unskippable_bundles
-                            .contains(&ts_entry.entry)
-                            .await?
-                        {
-                            break;
+                    .map_err(|error| (chain_id, origin, error))?;
+                if must_be_present {
+                    ensure!(
+                        was_present,
+                        ChainError::MissingCrossChainUpdate {
+                            chain_id,
+                            origin,
+                            height: bundle.height,
                         }
-                        self.removed_unskippable_bundles.remove(&ts_entry.entry)?;
-                    }
-                    self.unskippable_bundles.delete_front();
+                    );
                 }
             }
-            for entry in removed_unskippable {
-                self.removed_unskippable_bundles.insert(&entry)?;
-            }
         }
+        #[cfg(with_metrics)]
+        metrics::NUM_INBOXES
+            .with_label_values(&[])
+            .observe(self.inboxes.count().await? as f64);
         Ok(())
     }
 
+    /// Returns the chain IDs of all recipients for which a message is waiting in the outbox.
+    pub fn nonempty_outbox_chain_ids(&self) -> Vec<ChainId> {
+        self.nonempty_outboxes.get().iter().copied().collect()
+    }
+
+    /// Returns the outboxes for the given targets, or an error if any of them are missing.
+    pub async fn load_outboxes(
+        &self,
+        targets: &[ChainId],
+    ) -> Result<Vec<ReadGuardedView<OutboxStateView<C>>>, ChainError> {
+        let vec_of_options = self.outboxes.try_load_entries(targets).await?;
+        let optional_vec = vec_of_options.into_iter().collect::<Option<Vec<_>>>();
+        optional_vec.ok_or_else(|| ChainError::InternalError("Missing outboxes".into()))
+    }
+
     /// Executes a block: first the incoming messages, then the main operation.
-    /// * Modifies the state of outboxes and channels, if needed.
-    /// * As usual, in case of errors, `self` may not be consistent any more and should be thrown
-    ///   away.
-    /// * Returns the outcome of the execution.
-    pub async fn execute_block(
-        &mut self,
-        block: &Block,
+    /// Does not update chain state other than the execution state.
+    #[instrument(skip_all, fields(
+        chain_id = %block.chain_id,
+        block_height = %block.height
+    ))]
+    async fn execute_block_inner(
+        chain: &mut ExecutionStateView<C>,
+        confirmed_log: &LogView<C, CryptoHash>,
+        block: &ProposedBlock,
         local_time: Timestamp,
+        round: Option<u32>,
+        published_blobs: &[Blob],
         replaying_oracle_responses: Option<Vec<Vec<OracleResponse>>>,
     ) -> Result<BlockExecutionOutcome, ChainError> {
         #[cfg(with_metrics)]
-        let _execution_latency = BLOCK_EXECUTION_LATENCY.measure_latency();
+        let _execution_latency = metrics::BLOCK_EXECUTION_LATENCY.measure_latency_us();
+        chain.system.timestamp.set(block.timestamp);
 
-        let chain_id = self.chain_id();
-        assert_eq!(block.chain_id, chain_id);
-        // The first incoming message of any child chain must be `OpenChain`. A root chain must
-        // already be initialized
-        if block.height == BlockHeight::ZERO
-            && self
-                .execution_state
-                .system
-                .description
-                .get()
-                .map_or(true, |description| description.is_child())
+        let policy = chain
+            .system
+            .current_committee()
+            .ok_or_else(|| ChainError::InactiveChain(block.chain_id))?
+            .1
+            .policy()
+            .clone();
+
+        let mut resource_controller = ResourceController::new(
+            Arc::new(policy),
+            ResourceTracker::default(),
+            block.authenticated_owner,
+        );
+
+        for blob in published_blobs {
+            let blob_id = blob.id();
+            resource_controller
+                .policy()
+                .check_blob_size(blob.content())
+                .with_execution_context(ChainExecutionContext::Block)?;
+            chain.system.used_blobs.insert(&blob_id)?;
+        }
+
+        // Execute each incoming bundle as a transaction, then each operation.
+        // Collect messages, events and oracle responses, each as one list per transaction.
+        let mut block_execution_tracker = BlockExecutionTracker::new(
+            &mut resource_controller,
+            published_blobs
+                .iter()
+                .map(|blob| (blob.id(), blob))
+                .collect(),
+            local_time,
+            replaying_oracle_responses,
+            block,
+        )?;
+
+        for transaction in block.transaction_refs() {
+            block_execution_tracker
+                .execute_transaction(transaction, round, chain)
+                .await?;
+        }
+
+        let recipients = block_execution_tracker.recipients();
+        let mut recipient_heights = Vec::new();
+        let mut indices = Vec::new();
+        for (recipient, height) in chain
+            .previous_message_blocks
+            .multi_get_pairs(recipients)
+            .await?
         {
-            let (in_bundle, posted_message, config) = block
-                .starts_with_open_chain_message()
-                .ok_or_else(|| ChainError::InactiveChain(chain_id))?;
-            if !self.is_active() {
-                let message_id = MessageId {
-                    chain_id: in_bundle.origin.sender,
-                    height: in_bundle.bundle.height,
-                    index: posted_message.index,
-                };
-                self.execute_init_message(message_id, config, block.timestamp, local_time)
-                    .await?;
+            chain
+                .previous_message_blocks
+                .insert(&recipient, block.height)?;
+            if let Some(height) = height {
+                let index = usize::try_from(height.0).map_err(|_| ArithmeticError::Overflow)?;
+                indices.push(index);
+                recipient_heights.push((recipient, height));
             }
         }
+        let hashes = confirmed_log.multi_get(indices).await?;
+        let mut previous_message_blocks = BTreeMap::new();
+        for (hash, (recipient, height)) in hashes.into_iter().zip(recipient_heights) {
+            let hash = hash.ok_or_else(|| {
+                ChainError::InternalError("missing entry in confirmed_log".into())
+            })?;
+            previous_message_blocks.insert(recipient, (hash, height));
+        }
+
+        let streams = block_execution_tracker.event_streams();
+        let mut stream_heights = Vec::new();
+        let mut indices = Vec::new();
+        for (stream, height) in chain.previous_event_blocks.multi_get_pairs(streams).await? {
+            chain.previous_event_blocks.insert(&stream, block.height)?;
+            if let Some(height) = height {
+                let index = usize::try_from(height.0).map_err(|_| ArithmeticError::Overflow)?;
+                indices.push(index);
+                stream_heights.push((stream, height));
+            }
+        }
+        let hashes = confirmed_log.multi_get(indices).await?;
+        let mut previous_event_blocks = BTreeMap::new();
+        for (hash, (stream, height)) in hashes.into_iter().zip(stream_heights) {
+            let hash = hash.ok_or_else(|| {
+                ChainError::InternalError("missing entry in confirmed_log".into())
+            })?;
+            previous_event_blocks.insert(stream, (hash, height));
+        }
+
+        let state_hash = {
+            #[cfg(with_metrics)]
+            let _hash_latency = metrics::STATE_HASH_COMPUTATION_LATENCY.measure_latency();
+            chain.crypto_hash_mut().await?
+        };
+
+        let (messages, oracle_responses, events, blobs, operation_results) =
+            block_execution_tracker.finalize();
+
+        Ok(BlockExecutionOutcome {
+            messages,
+            previous_message_blocks,
+            previous_event_blocks,
+            state_hash,
+            oracle_responses,
+            events,
+            blobs,
+            operation_results,
+        })
+    }
+
+    /// Executes a block: first the incoming messages, then the main operation.
+    /// Does not update chain state other than the execution state.
+    #[instrument(skip_all, fields(
+        chain_id = %self.chain_id(),
+        block_height = %block.height
+    ))]
+    pub async fn execute_block(
+        &mut self,
+        block: &ProposedBlock,
+        local_time: Timestamp,
+        round: Option<u32>,
+        published_blobs: &[Blob],
+        replaying_oracle_responses: Option<Vec<Vec<OracleResponse>>>,
+    ) -> Result<BlockExecutionOutcome, ChainError> {
+        assert_eq!(
+            block.chain_id,
+            self.execution_state.context().extra().chain_id()
+        );
+
+        self.initialize_if_needed(local_time).await?;
+
+        let chain_timestamp = *self.execution_state.system.timestamp.get();
+        ensure!(
+            chain_timestamp <= block.timestamp,
+            ChainError::InvalidBlockTimestamp {
+                parent: chain_timestamp,
+                new: block.timestamp
+            }
+        );
+        ensure!(!block.transactions.is_empty(), ChainError::EmptyBlock);
 
         ensure!(
-            *self.execution_state.system.timestamp.get() <= block.timestamp,
-            ChainError::InvalidBlockTimestamp
+            block.published_blob_ids()
+                == published_blobs
+                    .iter()
+                    .map(|blob| blob.id())
+                    .collect::<BTreeSet<_>>(),
+            ChainError::InternalError("published_blobs mismatch".to_string())
         );
-        self.execution_state.system.timestamp.set(block.timestamp);
-        let Some((_, committee)) = self.execution_state.system.current_committee() else {
-            return Err(ChainError::InactiveChain(chain_id));
-        };
-        let mut resource_controller = ResourceController {
-            policy: Arc::new(committee.policy().clone()),
-            tracker: ResourceTracker::default(),
-            account: block.authenticated_signer,
-        };
-        resource_controller
-            .track_executed_block_size(EMPTY_EXECUTED_BLOCK_SIZE)
-            .and_then(|()| {
-                resource_controller
-                    .track_executed_block_size_sequence_extension(0, block.incoming_bundles.len())
-            })
-            .and_then(|()| {
-                resource_controller
-                    .track_executed_block_size_sequence_extension(0, block.operations.len())
-            })
-            .with_execution_context(ChainExecutionContext::Block)?;
 
-        if self.is_closed() {
-            ensure!(
-                !block.incoming_bundles.is_empty() && block.has_only_rejected_messages(),
-                ChainError::ClosedChain
-            );
+        if *self.execution_state.system.closed.get() {
+            ensure!(block.has_only_rejected_messages(), ChainError::ClosedChain);
         }
-        let app_permissions = self.execution_state.system.application_permissions.get();
-        let mut mandatory = HashSet::<UserApplicationId>::from_iter(
-            app_permissions.mandatory_applications.iter().cloned(),
+
+        Self::check_app_permissions(
+            self.execution_state.system.application_permissions.get(),
+            block,
+        )?;
+
+        Self::execute_block_inner(
+            &mut self.execution_state,
+            &self.confirmed_log,
+            block,
+            local_time,
+            round,
+            published_blobs,
+            replaying_oracle_responses,
+        )
+        .await
+    }
+
+    /// Applies an execution outcome to the chain, updating the outboxes, state hash and chain
+    /// manager. This does not touch the execution state itself, which must be updated separately.
+    /// Returns the set of event streams that were updated as a result of applying the block.
+    #[instrument(skip_all, fields(
+        chain_id = %self.chain_id(),
+        block_height = %block.inner().inner().header.height
+    ))]
+    pub async fn apply_confirmed_block(
+        &mut self,
+        block: &ConfirmedBlock,
+        local_time: Timestamp,
+    ) -> Result<BTreeSet<StreamId>, ChainError> {
+        let hash = block.inner().hash();
+        let block = block.inner().inner();
+        self.execution_state_hash.set(Some(block.header.state_hash));
+        let updated_streams = self.process_emitted_events(block).await?;
+        self.process_outgoing_messages(block).await?;
+
+        // Last, reset the consensus state based on the current ownership.
+        self.reset_chain_manager(block.header.height.try_add_one()?, local_time)?;
+
+        // Advance to next block height.
+        let tip = self.tip_state.get_mut();
+        tip.block_hash = Some(hash);
+        tip.next_block_height.try_add_assign_one()?;
+        tip.update_counters(&block.body.transactions, &block.body.messages)?;
+        self.confirmed_log.push(hash);
+        self.preprocessed_blocks.remove(&block.header.height)?;
+        Ok(updated_streams)
+    }
+
+    /// Adds a block to `preprocessed_blocks`, and updates the outboxes where possible.
+    /// Returns the set of streams that were updated as a result of preprocessing the block.
+    #[instrument(skip_all, fields(
+        chain_id = %self.chain_id(),
+        block_height = %block.inner().inner().header.height
+    ))]
+    pub async fn preprocess_block(
+        &mut self,
+        block: &ConfirmedBlock,
+    ) -> Result<BTreeSet<StreamId>, ChainError> {
+        let hash = block.inner().hash();
+        let block = block.inner().inner();
+        let height = block.header.height;
+        if height < self.tip_state.get().next_block_height {
+            return Ok(BTreeSet::new());
+        }
+        self.process_outgoing_messages(block).await?;
+        let updated_streams = self.process_emitted_events(block).await?;
+        self.preprocessed_blocks.insert(&height, hash)?;
+        Ok(updated_streams)
+    }
+
+    /// Returns whether this is a child chain.
+    pub fn is_child(&self) -> bool {
+        let Some(description) = self.execution_state.system.description.get() else {
+            // Root chains are always initialized, so this must be a child chain.
+            return true;
+        };
+        description.is_child()
+    }
+
+    /// Verifies that the block is valid according to the chain's application permission settings.
+    #[instrument(skip_all, fields(
+        block_height = %block.height,
+        num_transactions = %block.transactions.len()
+    ))]
+    fn check_app_permissions(
+        app_permissions: &ApplicationPermissions,
+        block: &ProposedBlock,
+    ) -> Result<(), ChainError> {
+        let mut mandatory = HashSet::<ApplicationId>::from_iter(
+            app_permissions.mandatory_applications.iter().copied(),
         );
-        for operation in &block.operations {
-            ensure!(
-                app_permissions.can_execute_operations(&operation.application_id()),
-                ChainError::AuthorizedApplications(
-                    app_permissions.execute_operations.clone().unwrap()
-                )
-            );
-            if let Operation::User { application_id, .. } = operation {
-                mandatory.remove(application_id);
-            }
-        }
-        for pending in block.incoming_messages() {
-            if mandatory.is_empty() {
-                break;
-            }
-            if let Message::User { application_id, .. } = &pending.message {
-                mandatory.remove(application_id);
+        for transaction in &block.transactions {
+            match transaction {
+                Transaction::ExecuteOperation(operation)
+                    if operation.is_exempt_from_permissions() =>
+                {
+                    mandatory.clear()
+                }
+                Transaction::ExecuteOperation(operation) => {
+                    ensure!(
+                        app_permissions.can_execute_operations(&operation.application_id()),
+                        ChainError::AuthorizedApplications(
+                            app_permissions.execute_operations.clone().unwrap()
+                        )
+                    );
+                    if let Operation::User { application_id, .. } = operation {
+                        mandatory.remove(application_id);
+                    }
+                }
+                Transaction::ReceiveMessages(incoming_bundle) => {
+                    for pending in incoming_bundle.messages() {
+                        if let Message::User { application_id, .. } = &pending.message {
+                            mandatory.remove(application_id);
+                        }
+                    }
+                }
             }
         }
         ensure!(
             mandatory.is_empty(),
             ChainError::MissingMandatoryApplications(mandatory.into_iter().collect())
         );
-
-        // Execute each incoming bundle as a transaction, then each operation.
-        // Collect messages, events and oracle responses, each as one list per transaction.
-        let mut replaying_oracle_responses = replaying_oracle_responses.map(Vec::into_iter);
-        let mut next_message_index = 0;
-        let mut oracle_responses = Vec::new();
-        let mut events = Vec::new();
-        let mut messages = Vec::new();
-        for (txn_index, transaction) in block.transactions() {
-            let chain_execution_context = match transaction {
-                Transaction::ReceiveMessages(_) => ChainExecutionContext::IncomingBundle(txn_index),
-                Transaction::ExecuteOperation(_) => ChainExecutionContext::Operation(txn_index),
-            };
-            let maybe_responses = match replaying_oracle_responses.as_mut().map(Iterator::next) {
-                Some(Some(responses)) => Some(responses),
-                Some(None) => return Err(ChainError::MissingOracleResponseList),
-                None => None,
-            };
-            let mut txn_tracker = TransactionTracker::new(next_message_index, maybe_responses);
-            match transaction {
-                Transaction::ReceiveMessages(incoming_bundle) => {
-                    resource_controller
-                        .track_executed_block_size_of(&incoming_bundle)
-                        .with_execution_context(chain_execution_context)?;
-                    for (message_id, posted_message) in incoming_bundle.messages_and_ids() {
-                        Box::pin(self.execute_message_in_block(
-                            message_id,
-                            posted_message,
-                            incoming_bundle,
-                            block,
-                            txn_index,
-                            local_time,
-                            &mut txn_tracker,
-                            &mut resource_controller,
-                        ))
-                        .await?;
-                    }
-                }
-                Transaction::ExecuteOperation(operation) => {
-                    resource_controller
-                        .track_executed_block_size_of(&operation)
-                        .with_execution_context(chain_execution_context)?;
-                    #[cfg(with_metrics)]
-                    let _operation_latency = OPERATION_EXECUTION_LATENCY.measure_latency();
-                    let context = OperationContext {
-                        chain_id,
-                        height: block.height,
-                        index: Some(txn_index),
-                        authenticated_signer: block.authenticated_signer,
-                        authenticated_caller_id: None,
-                    };
-                    Box::pin(self.execution_state.execute_operation(
-                        context,
-                        local_time,
-                        operation.clone(),
-                        &mut txn_tracker,
-                        &mut resource_controller,
-                    ))
-                    .await
-                    .with_execution_context(chain_execution_context)?;
-                    resource_controller
-                        .with_state(&mut self.execution_state)
-                        .await?
-                        .track_operation(operation)
-                        .with_execution_context(chain_execution_context)?;
-                }
-            }
-
-            self.execution_state
-                .update_execution_outcomes_with_app_registrations(&mut txn_tracker)
-                .await
-                .with_execution_context(chain_execution_context)?;
-            let (txn_outcomes, txn_oracle_responses, new_next_message_index) = txn_tracker
-                .destructure()
-                .with_execution_context(chain_execution_context)?;
-            next_message_index = new_next_message_index;
-            let (txn_messages, txn_events) = self
-                .process_execution_outcomes(block.height, txn_outcomes)
-                .await?;
-            if matches!(
-                transaction,
-                Transaction::ExecuteOperation(_)
-                    | Transaction::ReceiveMessages(IncomingBundle {
-                        action: MessageAction::Accept,
-                        ..
-                    })
-            ) {
-                for message_out in &txn_messages {
-                    resource_controller
-                        .with_state(&mut self.execution_state)
-                        .await?
-                        .track_message(&message_out.message)
-                        .with_execution_context(chain_execution_context)?;
-                }
-            }
-            resource_controller
-                .track_executed_block_size_of(&(&txn_oracle_responses, &txn_messages, &txn_events))
-                .with_execution_context(chain_execution_context)?;
-            resource_controller
-                .track_executed_block_size_sequence_extension(oracle_responses.len(), 1)
-                .with_execution_context(chain_execution_context)?;
-            resource_controller
-                .track_executed_block_size_sequence_extension(messages.len(), 1)
-                .with_execution_context(chain_execution_context)?;
-            resource_controller
-                .track_executed_block_size_sequence_extension(events.len(), 1)
-                .with_execution_context(chain_execution_context)?;
-            oracle_responses.push(txn_oracle_responses);
-            messages.push(txn_messages);
-            events.push(txn_events);
-        }
-
-        // Finally, charge for the block fee, except if the chain is closed. Closed chains should
-        // always be able to reject incoming messages.
-        if !self.is_closed() {
-            resource_controller
-                .with_state(&mut self.execution_state)
-                .await?
-                .track_block()
-                .with_execution_context(ChainExecutionContext::Block)?;
-        }
-
-        // Recompute the state hash.
-        let state_hash = {
-            #[cfg(with_metrics)]
-            let _hash_latency = STATE_HASH_COMPUTATION_LATENCY.measure_latency();
-            self.execution_state.crypto_hash().await?
-        };
-        self.execution_state_hash.set(Some(state_hash));
-        // Last, reset the consensus state based on the current ownership.
-        let maybe_committee = self.execution_state.system.current_committee().into_iter();
-
-        self.pending_validated_blobs.clear();
-        self.pending_validated_block.set(None);
-        self.manager.reset(
-            self.execution_state.system.ownership.get().clone(),
-            block.height.try_add_one()?,
-            local_time,
-            maybe_committee.flat_map(|(_, committee)| committee.keys_and_weights()),
-        )?;
-
-        #[cfg(with_metrics)]
-        {
-            // Log Prometheus metrics
-            NUM_BLOCKS_EXECUTED.with_label_values(&[]).inc();
-            WASM_FUEL_USED_PER_BLOCK
-                .with_label_values(&[])
-                .observe(resource_controller.tracker.fuel as f64);
-            WASM_NUM_READS_PER_BLOCK
-                .with_label_values(&[])
-                .observe(resource_controller.tracker.read_operations as f64);
-            WASM_BYTES_READ_PER_BLOCK
-                .with_label_values(&[])
-                .observe(resource_controller.tracker.bytes_read as f64);
-            WASM_BYTES_WRITTEN_PER_BLOCK
-                .with_label_values(&[])
-                .observe(resource_controller.tracker.bytes_written as f64);
-        }
-
-        assert_eq!(
-            messages.len(),
-            block.incoming_bundles.len() + block.operations.len()
-        );
-        let outcome = BlockExecutionOutcome {
-            messages,
-            state_hash,
-            oracle_responses,
-            events,
-        };
-        Ok(outcome)
-    }
-
-    /// Executes a message as part of an incoming bundle in a block.
-    #[expect(clippy::too_many_arguments)]
-    async fn execute_message_in_block(
-        &mut self,
-        message_id: MessageId,
-        posted_message: &PostedMessage,
-        incoming_bundle: &IncomingBundle,
-        block: &Block,
-        txn_index: u32,
-        local_time: Timestamp,
-        txn_tracker: &mut TransactionTracker,
-        resource_controller: &mut ResourceController<Option<Owner>>,
-    ) -> Result<(), ChainError> {
-        #[cfg(with_metrics)]
-        let _message_latency = MESSAGE_EXECUTION_LATENCY.measure_latency();
-        let context = MessageContext {
-            chain_id: block.chain_id,
-            is_bouncing: posted_message.is_bouncing(),
-            height: block.height,
-            certificate_hash: incoming_bundle.bundle.certificate_hash,
-            message_id,
-            authenticated_signer: posted_message.authenticated_signer,
-            refund_grant_to: posted_message.refund_grant_to,
-        };
-        let mut grant = posted_message.grant;
-        match incoming_bundle.action {
-            MessageAction::Accept => {
-                // Once a chain is closed, accepting incoming messages is not allowed.
-                ensure!(!self.is_closed(), ChainError::ClosedChain);
-
-                Box::pin(self.execution_state.execute_message(
-                    context,
-                    local_time,
-                    posted_message.message.clone(),
-                    (grant > Amount::ZERO).then_some(&mut grant),
-                    txn_tracker,
-                    resource_controller,
-                ))
-                .await
-                .with_execution_context(ChainExecutionContext::IncomingBundle(txn_index))?;
-                if grant > Amount::ZERO {
-                    if let Some(refund_grant_to) = posted_message.refund_grant_to {
-                        self.execution_state
-                            .send_refund(context, grant, refund_grant_to, txn_tracker)
-                            .await
-                            .with_execution_context(ChainExecutionContext::IncomingBundle(
-                                txn_index,
-                            ))?;
-                    }
-                }
-            }
-            MessageAction::Reject => {
-                // If rejecting a message fails, the entire block proposal should be
-                // scrapped.
-                ensure!(
-                    !posted_message.is_protected() || self.is_closed(),
-                    ChainError::CannotRejectMessage {
-                        chain_id: block.chain_id,
-                        origin: Box::new(incoming_bundle.origin.clone()),
-                        posted_message: Box::new(posted_message.clone()),
-                    }
-                );
-                if posted_message.is_tracked() {
-                    // Bounce the message.
-                    self.execution_state
-                        .bounce_message(context, grant, posted_message.message.clone(), txn_tracker)
-                        .await
-                        .with_execution_context(ChainExecutionContext::Block)?;
-                } else if grant > Amount::ZERO {
-                    // Nothing to do except maybe refund the grant.
-                    let Some(refund_grant_to) = posted_message.refund_grant_to else {
-                        // See OperationContext::refund_grant_to()
-                        return Err(ChainError::InternalError(
-                            "Messages with grants should have a non-empty `refund_grant_to`".into(),
-                        ));
-                    };
-                    // Refund grant.
-                    self.execution_state
-                        .send_refund(context, posted_message.grant, refund_grant_to, txn_tracker)
-                        .await
-                        .with_execution_context(ChainExecutionContext::Block)?;
-                }
-            }
-        }
         Ok(())
     }
 
-    async fn process_execution_outcomes(
-        &mut self,
-        height: BlockHeight,
-        results: Vec<ExecutionOutcome>,
-    ) -> Result<(Vec<OutgoingMessage>, Vec<EventRecord>), ChainError> {
-        let mut messages = Vec::new();
-        let mut events = Vec::new();
-        for result in results {
-            match result {
-                ExecutionOutcome::System(result) => {
-                    self.process_raw_execution_outcome(
-                        GenericApplicationId::System,
-                        Message::System,
-                        &mut messages,
-                        &mut events,
-                        height,
-                        result,
-                    )
-                    .await?;
-                }
-                ExecutionOutcome::User(application_id, result) => {
-                    self.process_raw_execution_outcome(
-                        GenericApplicationId::User(application_id),
-                        |bytes| Message::User {
-                            application_id,
-                            bytes,
-                        },
-                        &mut messages,
-                        &mut events,
-                        height,
-                        result,
-                    )
-                    .await?;
-                }
-            }
-        }
-        Ok((messages, events))
+    /// Returns the hashes of all blocks we have in the given range.
+    ///
+    /// If the input heights are in ascending order, the hashes will be in the same order.
+    /// Otherwise they may be unordered.
+    #[instrument(skip_all, fields(
+        chain_id = %self.chain_id(),
+        next_block_height = %self.tip_state.get().next_block_height,
+    ))]
+    pub async fn block_hashes(
+        &self,
+        heights: impl IntoIterator<Item = BlockHeight>,
+    ) -> Result<Vec<CryptoHash>, ChainError> {
+        let next_height = self.tip_state.get().next_block_height;
+        // Everything up to (excluding) next_height is in confirmed_log.
+        let (confirmed_heights, unconfirmed_heights) = heights
+            .into_iter()
+            .partition::<Vec<_>, _>(|height| *height < next_height);
+        let confirmed_indices = confirmed_heights
+            .into_iter()
+            .map(|height| usize::try_from(height.0).map_err(|_| ArithmeticError::Overflow))
+            .collect::<Result<_, _>>()?;
+        let confirmed_hashes = self.confirmed_log.multi_get(confirmed_indices).await?;
+        // Everything after (including) next_height in preprocessed_blocks if we have it.
+        let unconfirmed_hashes = self
+            .preprocessed_blocks
+            .multi_get(&unconfirmed_heights)
+            .await?;
+        Ok(confirmed_hashes
+            .into_iter()
+            .chain(unconfirmed_hashes)
+            .flatten()
+            .collect())
     }
 
-    async fn process_raw_execution_outcome<E, F>(
+    /// Resets the chain manager for the next block height.
+    fn reset_chain_manager(
         &mut self,
-        application_id: GenericApplicationId,
-        lift: F,
-        messages: &mut Vec<OutgoingMessage>,
-        events: &mut Vec<EventRecord>,
-        height: BlockHeight,
-        raw_outcome: RawExecutionOutcome<E, Amount>,
-    ) -> Result<(), ChainError>
-    where
-        F: Fn(E) -> Message,
-    {
-        events.extend(
-            raw_outcome
-                .events
-                .into_iter()
-                .map(|(stream_name, key, value)| EventRecord {
-                    stream_id: StreamId {
-                        application_id,
-                        stream_name,
-                    },
-                    key,
-                    value,
-                }),
-        );
-        let max_stream_queries = self.context().max_stream_queries();
+        next_height: BlockHeight,
+        local_time: Timestamp,
+    ) -> Result<(), ChainError> {
+        let maybe_committee = self.execution_state.system.current_committee().into_iter();
+        let ownership = self.execution_state.system.ownership.get().clone();
+        let fallback_owners =
+            maybe_committee.flat_map(|(_, committee)| committee.account_keys_and_weights());
+        self.pending_validated_blobs.clear();
+        self.pending_proposed_blobs.clear();
+        self.manager
+            .reset(ownership, next_height, local_time, fallback_owners)
+    }
+
+    /// Updates the outboxes with the messages sent in the block.
+    ///
+    /// Returns the set of all recipients.
+    #[instrument(skip_all, fields(
+        chain_id = %self.chain_id(),
+        block_height = %block.header.height
+    ))]
+    async fn process_outgoing_messages(
+        &mut self,
+        block: &Block,
+    ) -> Result<Vec<ChainId>, ChainError> {
         // Record the messages of the execution. Messages are understood within an
         // application.
-        let mut recipients = HashSet::new();
-        let mut channel_broadcasts = HashSet::new();
-        for RawOutgoingMessage {
-            destination,
-            authenticated,
-            grant,
-            kind,
-            message,
-        } in raw_outcome.messages
-        {
-            match &destination {
-                Destination::Recipient(id) => {
-                    recipients.insert(*id);
-                }
-                Destination::Subscribers(name) => {
-                    ensure!(grant == Amount::ZERO, ChainError::GrantUseOnBroadcast);
-                    channel_broadcasts.insert(name.clone());
-                }
-            }
-            let authenticated_signer = raw_outcome.authenticated_signer.filter(|_| authenticated);
-            let refund_grant_to = raw_outcome.refund_grant_to.filter(|_| grant > Amount::ZERO);
-            messages.push(OutgoingMessage {
-                destination,
-                authenticated_signer,
-                grant,
-                refund_grant_to,
-                kind,
-                message: lift(message),
-            });
-        }
+        let recipients = block.recipients();
+        let block_height = block.header.height;
+        let next_height = self.tip_state.get().next_block_height;
 
-        // Update the (regular) outboxes.
+        // Update the outboxes.
         let outbox_counters = self.outbox_counters.get_mut();
-        let targets = recipients
-            .into_iter()
-            .map(Target::chain)
-            .collect::<Vec<_>>();
+        let nonempty_outboxes = self.nonempty_outboxes.get_mut();
+        let targets = recipients.into_iter().collect::<Vec<_>>();
         let outboxes = self.outboxes.try_load_entries_mut(&targets).await?;
-        for mut outbox in outboxes {
-            if outbox.schedule_message(height)? {
-                *outbox_counters.entry(height).or_default() += 1;
-            }
-        }
-
-        // Update the channels.
-        self.process_unsubscribes(raw_outcome.unsubscribe, application_id)
-            .await?;
-
-        let full_names = channel_broadcasts
-            .into_iter()
-            .map(|name| ChannelFullName {
-                application_id,
-                name,
-            })
-            .collect::<Vec<_>>();
-        let channels = self.channels.try_load_entries_mut(&full_names).await?;
-        let stream = full_names.into_iter().zip(channels);
-        let stream = stream::iter(stream)
-            .map(|(full_name, mut channel)| async move {
-                let recipients = channel.subscribers.indices().await?;
-                channel.block_heights.push(height);
-                let targets = recipients
-                    .into_iter()
-                    .map(|recipient| Target::channel(recipient, full_name.clone()))
-                    .collect::<Vec<_>>();
-                Ok::<_, ChainError>(targets)
-            })
-            .buffer_unordered(max_stream_queries);
-        let infos = stream.try_collect::<Vec<_>>().await?;
-        let targets = infos.into_iter().flatten().collect::<Vec<_>>();
-        let outboxes = self.outboxes.try_load_entries_mut(&targets).await?;
-        let outbox_counters = self.outbox_counters.get_mut();
-        for mut outbox in outboxes {
-            if outbox.schedule_message(height)? {
-                *outbox_counters.entry(height).or_default() += 1;
-            }
-        }
-
-        self.process_subscribes(raw_outcome.subscribe, application_id)
-            .await?;
-        Ok(())
-    }
-
-    /// Processes new subscriptions. Returns `true` if at least one new subscriber was added for
-    /// which we have outgoing messages.
-    async fn process_subscribes(
-        &mut self,
-        names_and_ids: Vec<(ChannelName, ChainId)>,
-        application_id: GenericApplicationId,
-    ) -> Result<bool, ChainError> {
-        if names_and_ids.is_empty() {
-            return Ok(false);
-        }
-        let full_names = names_and_ids
-            .iter()
-            .map(|(name, _)| ChannelFullName {
-                application_id,
-                name: name.clone(),
-            })
-            .collect::<Vec<_>>();
-        let channels = self.channels.try_load_entries_mut(&full_names).await?;
-        let subscribe_channels = names_and_ids.into_iter().zip(channels);
-        let max_stream_queries = self.context().max_stream_queries();
-        let stream = stream::iter(subscribe_channels)
-            .map(|((name, id), mut channel)| async move {
-                if channel.subscribers.contains(&id).await? {
-                    return Ok(None); // Was already a subscriber.
+        for (mut outbox, target) in outboxes.into_iter().zip(&targets) {
+            if block_height > next_height {
+                // There may be a gap in the chain before this block. We can only add it to this
+                // outbox if the previous message to the same recipient has already been added.
+                if *outbox.next_height_to_schedule.get() > block_height {
+                    continue; // We already added this recipient's messages to the outbox.
                 }
-                let full_name = ChannelFullName {
-                    application_id,
-                    name,
+                let maybe_prev_hash = match outbox.next_height_to_schedule.get().try_sub_one().ok()
+                {
+                    // The block with the last added message has already been executed; look up its
+                    // hash in the confirmed_log.
+                    Some(height) if height < next_height => {
+                        let index =
+                            usize::try_from(height.0).map_err(|_| ArithmeticError::Overflow)?;
+                        Some(self.confirmed_log.get(index).await?.ok_or_else(|| {
+                            ChainError::InternalError("missing entry in confirmed_log".into())
+                        })?)
+                    }
+                    // The block with last added message has not been executed yet. If we have it,
+                    // it's in preprocessed_blocks.
+                    Some(height) => Some(self.preprocessed_blocks.get(&height).await?.ok_or_else(
+                        || ChainError::InternalError("missing entry in preprocessed_blocks".into()),
+                    )?),
+                    None => None, // No message to that sender was added yet.
                 };
-                tracing::trace!("Adding subscriber {id:.8} for {full_name:}");
-                channel.subscribers.insert(&id)?;
-                // Send all messages.
-                let heights = channel.block_heights.read(..).await?;
-                if heights.is_empty() {
-                    return Ok(None); // No messages on this channel yet.
-                }
-                let target = Target::channel(id, full_name.clone());
-                Ok::<_, ChainError>(Some((target, heights)))
-            })
-            .buffer_unordered(max_stream_queries);
-        let infos = stream.try_collect::<Vec<_>>().await?;
-        let (targets, heights): (Vec<_>, Vec<_>) = infos.into_iter().flatten().unzip();
-        let mut new_outbox_entries = false;
-        let outboxes = self.outboxes.try_load_entries_mut(&targets).await?;
-        let outbox_counters = self.outbox_counters.get_mut();
-        for (heights, mut outbox) in heights.into_iter().zip(outboxes) {
-            for height in heights {
-                if outbox.schedule_message(height)? {
-                    *outbox_counters.entry(height).or_default() += 1;
-                    new_outbox_entries = true;
+                // Only schedule if this block contains the next message for that recipient.
+                match (
+                    maybe_prev_hash,
+                    block.body.previous_message_blocks.get(target),
+                ) {
+                    (None, None) => {
+                        // No previous message block expected and none indicated by the outbox -
+                        // all good
+                    }
+                    (Some(_), None) => {
+                        // Outbox indicates there was a previous message block, but
+                        // previous_message_blocks has no idea about it - possible bug
+                        return Err(ChainError::InternalError(
+                            "block indicates no previous message block,\
+                            but we have one in the outbox"
+                                .into(),
+                        ));
+                    }
+                    (None, Some((_, prev_msg_block_height))) => {
+                        // We have no previously processed block in the outbox, but we are
+                        // expecting one - this could be due to an empty outbox having been pruned.
+                        // Only process the outbox if the height of the previous message block is
+                        // lower than the tip
+                        if *prev_msg_block_height >= next_height {
+                            continue;
+                        }
+                    }
+                    (Some(ref prev_hash), Some((prev_msg_block_hash, _))) => {
+                        // Only process the outbox if the hashes match.
+                        if prev_hash != prev_msg_block_hash {
+                            continue;
+                        }
+                    }
                 }
             }
+            if outbox.schedule_message(block_height)? {
+                *outbox_counters.entry(block_height).or_default() += 1;
+                nonempty_outboxes.insert(*target);
+            }
         }
-        Ok(new_outbox_entries)
+
+        #[cfg(with_metrics)]
+        metrics::NUM_OUTBOXES
+            .with_label_values(&[])
+            .observe(self.outboxes.count().await? as f64);
+        Ok(targets)
     }
 
-    async fn process_unsubscribes(
+    /// Updates the event streams with events emitted by the block if they form a contiguous
+    /// sequence (might not be the case when preprocessing a block).
+    /// Returns the set of updated event streams.
+    #[instrument(skip_all, fields(
+        chain_id = %self.chain_id(),
+        block_height = %block.header.height
+    ))]
+    async fn process_emitted_events(
         &mut self,
-        names_and_ids: Vec<(ChannelName, ChainId)>,
-        application_id: GenericApplicationId,
-    ) -> Result<(), ChainError> {
-        if names_and_ids.is_empty() {
-            return Ok(());
+        block: &Block,
+    ) -> Result<BTreeSet<StreamId>, ChainError> {
+        let mut emitted_streams = BTreeMap::<StreamId, BTreeSet<u32>>::new();
+        for event in block.body.events.iter().flatten() {
+            emitted_streams
+                .entry(event.stream_id.clone())
+                .or_default()
+                .insert(event.index);
         }
-        let full_names = names_and_ids
-            .iter()
-            .map(|(name, _)| ChannelFullName {
-                application_id,
-                name: name.clone(),
-            })
-            .collect::<Vec<_>>();
-        let channels = self.channels.try_load_entries_mut(&full_names).await?;
-        for ((_name, id), mut channel) in names_and_ids.into_iter().zip(channels) {
-            // Remove subscriber. Do not remove the channel outbox yet.
-            channel.subscribers.remove(&id)?;
+        let mut stream_ids = Vec::new();
+        let mut list_indices = Vec::new();
+        for (stream_id, indices) in emitted_streams {
+            stream_ids.push(stream_id);
+            list_indices.push(indices);
         }
-        Ok(())
+
+        let mut updated_streams = BTreeSet::new();
+        for ((stream_id, next_index), indices) in self
+            .next_expected_events
+            .multi_get_pairs(stream_ids)
+            .await?
+            .into_iter()
+            .zip(list_indices)
+        {
+            let initial_index = if stream_id == StreamId::system(EPOCH_STREAM_NAME) {
+                // we don't expect the epoch stream to contain event 0
+                1
+            } else {
+                0
+            };
+            let mut current_expected_index = next_index.unwrap_or(initial_index);
+            for index in indices {
+                if index == current_expected_index {
+                    updated_streams.insert(stream_id.clone());
+                    current_expected_index = index.saturating_add(1);
+                }
+            }
+            if current_expected_index != 0 {
+                self.next_expected_events
+                    .insert(&stream_id, current_expected_index)?;
+            }
+        }
+        Ok(updated_streams)
     }
 }
 
 #[test]
-fn empty_executed_block_size() {
-    let executed_block = crate::data_types::ExecutedBlock {
-        block: crate::test::make_first_block(ChainId::root(0)),
-        outcome: crate::data_types::BlockExecutionOutcome::default(),
-    };
-    let size = bcs::serialized_size(&executed_block).unwrap();
-    assert_eq!(size, EMPTY_EXECUTED_BLOCK_SIZE);
+fn empty_block_size() {
+    let size = bcs::serialized_size(&crate::block::Block::new(
+        crate::test::make_first_block(
+            linera_execution::test_utils::dummy_chain_description(0).id(),
+        ),
+        crate::data_types::BlockExecutionOutcome::default(),
+    ))
+    .unwrap();
+    assert_eq!(size, EMPTY_BLOCK_SIZE);
 }

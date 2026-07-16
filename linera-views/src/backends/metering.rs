@@ -10,18 +10,15 @@ use std::{
 
 use convert_case::{Case, Casing};
 use linera_base::prometheus_util::{
-    register_histogram_vec, register_int_counter_vec, MeasureLatency,
+    register_histogram_vec, register_int_counter_vec, MeasureLatency as _,
 };
 use prometheus::{HistogramVec, IntCounterVec};
 
 #[cfg(with_testing)]
-use crate::store::TestKeyValueStore;
+use crate::store::TestKeyValueDatabase;
 use crate::{
     batch::Batch,
-    store::{
-        AdminKeyValueStore, KeyIterable as _, KeyValueIterable as _, ReadableKeyValueStore,
-        WithError, WritableKeyValueStore,
-    },
+    store::{KeyValueDatabase, ReadableKeyValueStore, WithError, WritableKeyValueStore},
 };
 
 #[derive(Clone)]
@@ -36,8 +33,10 @@ pub struct KeyValueStoreMetrics {
     write_batch_latency: HistogramVec,
     clear_journal_latency: HistogramVec,
     connect_latency: HistogramVec,
-    clone_with_root_key_latency: HistogramVec,
+    open_shared_latency: HistogramVec,
+    open_exclusive_latency: HistogramVec,
     list_all_latency: HistogramVec,
+    list_root_keys_latency: HistogramVec,
     delete_all_latency: HistogramVec,
     exists_latency: HistogramVec,
     create_latency: HistogramVec,
@@ -129,13 +128,21 @@ impl KeyValueStoreMetrics {
         let entry2 = format!("{} connect latency", title_name);
         let connect_latency = register_histogram_vec(&entry1, &entry2, &[], None);
 
-        let entry1 = format!("{}_clone_with_root_key_latency", var_name);
-        let entry2 = format!("{} clone with root key latency", title_name);
-        let clone_with_root_key_latency = register_histogram_vec(&entry1, &entry2, &[], None);
+        let entry1 = format!("{}_open_shared_latency", var_name);
+        let entry2 = format!("{} open shared partition", title_name);
+        let open_shared_latency = register_histogram_vec(&entry1, &entry2, &[], None);
+
+        let entry1 = format!("{}_open_exclusive_latency", var_name);
+        let entry2 = format!("{} open exclusive partition", title_name);
+        let open_exclusive_latency = register_histogram_vec(&entry1, &entry2, &[], None);
 
         let entry1 = format!("{}_list_all_latency", var_name);
         let entry2 = format!("{} list all latency", title_name);
         let list_all_latency = register_histogram_vec(&entry1, &entry2, &[], None);
+
+        let entry1 = format!("{}_list_root_keys_latency", var_name);
+        let entry2 = format!("{} list root keys latency", title_name);
+        let list_root_keys_latency = register_histogram_vec(&entry1, &entry2, &[], None);
 
         let entry1 = format!("{}_delete_all_latency", var_name);
         let entry2 = format!("{} delete all latency", title_name);
@@ -153,8 +160,8 @@ impl KeyValueStoreMetrics {
         let entry2 = format!("{} delete latency", title_name);
         let delete_latency = register_histogram_vec(&entry1, &entry2, &[], None);
 
-        let entry1 = format!("{}_read_value_number_none_cases", var_name);
-        let entry2 = format!("{} read value number none cases", title_name);
+        let entry1 = format!("{}_read_value_none_cases", var_name);
+        let entry2 = format!("{} read value none cases", title_name);
         let read_value_none_cases = register_int_counter_vec(&entry1, &entry2, &[]);
 
         let entry1 = format!("{}_read_value_key_size", var_name);
@@ -234,8 +241,10 @@ impl KeyValueStoreMetrics {
             write_batch_latency,
             clear_journal_latency,
             connect_latency,
-            clone_with_root_key_latency,
+            open_shared_latency,
+            open_exclusive_latency,
             list_all_latency,
+            list_root_keys_latency,
             delete_all_latency,
             exists_latency,
             create_latency,
@@ -261,32 +270,50 @@ impl KeyValueStoreMetrics {
     }
 }
 
-/// A metered wrapper that keeps track of every operation
+/// A metered database that keeps track of every operation.
 #[derive(Clone)]
-pub struct MeteredStore<K> {
-    /// the metrics being stored
+pub struct MeteredDatabase<D> {
+    /// The metrics being computed.
     counter: Arc<KeyValueStoreMetrics>,
-    /// The underlying store of the metered store
-    store: K,
+    /// The underlying database.
+    database: D,
 }
 
-impl<K> WithError for MeteredStore<K>
-where
-    K: WithError,
-{
-    type Error = K::Error;
+/// A metered store that keeps track of every operation.
+#[derive(Clone)]
+pub struct MeteredStore<S> {
+    /// The metrics being computed.
+    counter: Arc<KeyValueStoreMetrics>,
+    /// The underlying store.
+    store: S,
 }
 
-impl<K> ReadableKeyValueStore for MeteredStore<K>
+impl<D> WithError for MeteredDatabase<D>
 where
-    K: ReadableKeyValueStore + Send + Sync,
+    D: WithError,
 {
-    const MAX_KEY_SIZE: usize = K::MAX_KEY_SIZE;
-    type Keys = K::Keys;
-    type KeyValues = K::KeyValues;
+    type Error = D::Error;
+}
+
+impl<S> WithError for MeteredStore<S>
+where
+    S: WithError,
+{
+    type Error = S::Error;
+}
+
+impl<S> ReadableKeyValueStore for MeteredStore<S>
+where
+    S: ReadableKeyValueStore,
+{
+    const MAX_KEY_SIZE: usize = S::MAX_KEY_SIZE;
 
     fn max_stream_queries(&self) -> usize {
         self.store.max_stream_queries()
+    }
+
+    fn root_key(&self) -> Result<Vec<u8>, Self::Error> {
+        self.store.root_key()
     }
 
     async fn read_value_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
@@ -320,7 +347,7 @@ where
         self.store.contains_key(key).await
     }
 
-    async fn contains_keys(&self, keys: Vec<Vec<u8>>) -> Result<Vec<bool>, Self::Error> {
+    async fn contains_keys(&self, keys: &[Vec<u8>]) -> Result<Vec<bool>, Self::Error> {
         let _latency = self.counter.contains_keys_latency.measure_latency();
         self.counter
             .contains_keys_num_entries
@@ -336,7 +363,7 @@ where
 
     async fn read_multi_values_bytes(
         &self,
-        keys: Vec<Vec<u8>>,
+        keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
         let _latency = self
             .counter
@@ -354,7 +381,7 @@ where
         self.store.read_multi_values_bytes(keys).await
     }
 
-    async fn find_keys_by_prefix(&self, key_prefix: &[u8]) -> Result<Self::Keys, Self::Error> {
+    async fn find_keys_by_prefix(&self, key_prefix: &[u8]) -> Result<Vec<Vec<u8>>, Self::Error> {
         let _latency = self.counter.find_keys_by_prefix_latency.measure_latency();
         self.counter
             .find_keys_by_prefix_prefix_size
@@ -362,10 +389,8 @@ where
             .observe(key_prefix.len() as f64);
         let result = self.store.find_keys_by_prefix(key_prefix).await?;
         let (num_keys, keys_size) = result
-            .iterator()
-            .map(|key| key.map(|k| k.len()))
-            .collect::<Result<Vec<usize>, _>>()?
-            .into_iter()
+            .iter()
+            .map(|key| key.len())
             .fold((0, 0), |(count, size), len| (count + 1, size + len));
         self.counter
             .find_keys_by_prefix_num_keys
@@ -381,7 +406,7 @@ where
     async fn find_key_values_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Self::KeyValues, Self::Error> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Self::Error> {
         let _latency = self
             .counter
             .find_key_values_by_prefix_latency
@@ -392,10 +417,8 @@ where
             .observe(key_prefix.len() as f64);
         let result = self.store.find_key_values_by_prefix(key_prefix).await?;
         let (num_keys, key_values_size) = result
-            .iterator()
-            .map(|key_value| key_value.map(|(key, value)| key.len() + value.len()))
-            .collect::<Result<Vec<usize>, _>>()?
-            .into_iter()
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
             .fold((0, 0), |(count, size), len| (count + 1, size + len));
         self.counter
             .find_key_values_by_prefix_num_keys
@@ -409,11 +432,11 @@ where
     }
 }
 
-impl<K> WritableKeyValueStore for MeteredStore<K>
+impl<S> WritableKeyValueStore for MeteredStore<S>
 where
-    K: WritableKeyValueStore + Send + Sync,
+    S: WritableKeyValueStore,
 {
-    const MAX_VALUE_SIZE: usize = K::MAX_VALUE_SIZE;
+    const MAX_VALUE_SIZE: usize = S::MAX_VALUE_SIZE;
 
     async fn write_batch(&self, batch: Batch) -> Result<(), Self::Error> {
         let _latency = self.counter.write_batch_latency.measure_latency();
@@ -430,41 +453,45 @@ where
     }
 }
 
-impl<K> AdminKeyValueStore for MeteredStore<K>
+impl<D> KeyValueDatabase for MeteredDatabase<D>
 where
-    K: AdminKeyValueStore + Send + Sync,
+    D: KeyValueDatabase,
 {
-    type Config = K::Config;
+    type Config = D::Config;
+    type Store = MeteredStore<D::Store>;
 
     fn get_name() -> String {
-        K::get_name()
+        D::get_name()
     }
 
-    async fn connect(
-        config: &Self::Config,
-        namespace: &str,
-        root_key: &[u8],
-    ) -> Result<Self, Self::Error> {
-        let name = K::get_name();
+    async fn connect(config: &Self::Config, namespace: &str) -> Result<Self, Self::Error> {
+        let name = D::get_name();
         let counter = get_counter(&name);
         let _latency = counter.connect_latency.measure_latency();
-        let store = K::connect(config, namespace, root_key).await?;
+        let database = D::connect(config, namespace).await?;
         let counter = get_counter(&name);
-        Ok(Self { counter, store })
+        Ok(Self { counter, database })
     }
 
-    fn clone_with_root_key(&self, root_key: &[u8]) -> Result<Self, Self::Error> {
-        let _latency = self.counter.clone_with_root_key_latency.measure_latency();
-        let store = self.store.clone_with_root_key(root_key)?;
+    fn open_shared(&self, root_key: &[u8]) -> Result<Self::Store, Self::Error> {
+        let _latency = self.counter.open_shared_latency.measure_latency();
+        let store = self.database.open_shared(root_key)?;
         let counter = self.counter.clone();
-        Ok(Self { counter, store })
+        Ok(MeteredStore { counter, store })
+    }
+
+    fn open_exclusive(&self, root_key: &[u8]) -> Result<Self::Store, Self::Error> {
+        let _latency = self.counter.open_exclusive_latency.measure_latency();
+        let store = self.database.open_exclusive(root_key)?;
+        let counter = self.counter.clone();
+        Ok(MeteredStore { counter, store })
     }
 
     async fn list_all(config: &Self::Config) -> Result<Vec<String>, Self::Error> {
-        let name = K::get_name();
+        let name = D::get_name();
         let counter = get_counter(&name);
         let _latency = counter.list_all_latency.measure_latency();
-        let namespaces = K::list_all(config).await?;
+        let namespaces = D::list_all(config).await?;
         let counter = get_counter(&name);
         counter
             .list_all_sizes
@@ -473,18 +500,23 @@ where
         Ok(namespaces)
     }
 
+    async fn list_root_keys(&self) -> Result<Vec<Vec<u8>>, Self::Error> {
+        let _latency = self.counter.list_root_keys_latency.measure_latency();
+        self.database.list_root_keys().await
+    }
+
     async fn delete_all(config: &Self::Config) -> Result<(), Self::Error> {
-        let name = K::get_name();
+        let name = D::get_name();
         let counter = get_counter(&name);
         let _latency = counter.delete_all_latency.measure_latency();
-        K::delete_all(config).await
+        D::delete_all(config).await
     }
 
     async fn exists(config: &Self::Config, namespace: &str) -> Result<bool, Self::Error> {
-        let name = K::get_name();
+        let name = D::get_name();
         let counter = get_counter(&name);
         let _latency = counter.exists_latency.measure_latency();
-        let result = K::exists(config, namespace).await?;
+        let result = D::exists(config, namespace).await?;
         if result {
             let counter = get_counter(&name);
             counter.exists_true_cases.with_label_values(&[]).inc();
@@ -493,26 +525,26 @@ where
     }
 
     async fn create(config: &Self::Config, namespace: &str) -> Result<(), Self::Error> {
-        let name = K::get_name();
+        let name = D::get_name();
         let counter = get_counter(&name);
         let _latency = counter.create_latency.measure_latency();
-        K::create(config, namespace).await
+        D::create(config, namespace).await
     }
 
     async fn delete(config: &Self::Config, namespace: &str) -> Result<(), Self::Error> {
-        let name = K::get_name();
+        let name = D::get_name();
         let counter = get_counter(&name);
         let _latency = counter.delete_latency.measure_latency();
-        K::delete(config, namespace).await
+        D::delete(config, namespace).await
     }
 }
 
 #[cfg(with_testing)]
-impl<K> TestKeyValueStore for MeteredStore<K>
+impl<D> TestKeyValueDatabase for MeteredDatabase<D>
 where
-    K: TestKeyValueStore + Send + Sync,
+    D: TestKeyValueDatabase,
 {
-    async fn new_test_config() -> Result<K::Config, Self::Error> {
-        K::new_test_config().await
+    async fn new_test_config() -> Result<D::Config, Self::Error> {
+        D::new_test_config().await
     }
 }

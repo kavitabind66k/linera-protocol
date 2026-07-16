@@ -4,22 +4,37 @@
 //! Structures defining the set of owners and super owners, as well as the consensus
 //! round types and timeouts for chains.
 
-use std::{collections::BTreeMap, iter};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    iter,
+};
 
+use allocative::Allocative;
 use custom_debug_derive::Debug;
 use linera_witty::{WitLoad, WitStore, WitType};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    crypto::PublicKey,
     data_types::{Round, TimeDelta},
     doc_scalar,
-    identifiers::Owner,
+    identifiers::AccountOwner,
 };
 
 /// The timeout configuration: how long fast, multi-leader and single-leader rounds last.
-#[derive(PartialEq, Eq, Clone, Hash, Debug, Serialize, Deserialize, WitLoad, WitStore, WitType)]
+#[derive(
+    PartialEq,
+    Eq,
+    Clone,
+    Hash,
+    Debug,
+    Serialize,
+    Deserialize,
+    WitLoad,
+    WitStore,
+    WitType,
+    Allocative,
+)]
 pub struct TimeoutConfig {
     /// The duration of the fast round.
     #[debug(skip_if = Option::is_none)]
@@ -39,70 +54,97 @@ impl Default for TimeoutConfig {
             fast_round_duration: None,
             base_timeout: TimeDelta::from_secs(10),
             timeout_increment: TimeDelta::from_secs(1),
-            fallback_duration: TimeDelta::from_secs(60 * 60 * 24),
+            // This is `MAX` because the validators are not currently expected to start clients for
+            // every chain with an old tracked message in the inbox.
+            fallback_duration: TimeDelta::MAX,
         }
     }
 }
 
 /// Represents the owner(s) of a chain.
 #[derive(
-    PartialEq, Eq, Clone, Hash, Debug, Default, Serialize, Deserialize, WitLoad, WitStore, WitType,
+    PartialEq,
+    Eq,
+    Clone,
+    Hash,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    WitLoad,
+    WitStore,
+    WitType,
+    Allocative,
 )]
 pub struct ChainOwnership {
     /// Super owners can propose fast blocks in the first round, and regular blocks in any round.
-    #[debug(skip_if = BTreeMap::is_empty)]
-    pub super_owners: BTreeMap<Owner, PublicKey>,
+    #[debug(skip_if = BTreeSet::is_empty)]
+    pub super_owners: BTreeSet<AccountOwner>,
     /// The regular owners, with their weights that determine how often they are round leader.
     #[debug(skip_if = BTreeMap::is_empty)]
-    pub owners: BTreeMap<Owner, (PublicKey, u64)>,
-    /// The number of initial rounds after 0 in which all owners are allowed to propose blocks.
+    pub owners: BTreeMap<AccountOwner, u64>,
+    /// The leader of the first single-leader round. If not set, this is random like other rounds.
+    pub first_leader: Option<AccountOwner>,
+    /// The number of rounds in which all owners are allowed to propose blocks.
     pub multi_leader_rounds: u32,
+    /// Whether the multi-leader rounds are unrestricted, i.e. not limited to chain owners.
+    /// This should only be `true` on chains with restrictive application permissions and an
+    /// application-based mechanism to select block proposers.
+    pub open_multi_leader_rounds: bool,
     /// The timeout configuration: how long fast, multi-leader and single-leader rounds last.
     pub timeout_config: TimeoutConfig,
 }
 
 impl ChainOwnership {
     /// Creates a `ChainOwnership` with a single super owner.
-    pub fn single_super(public_key: PublicKey) -> Self {
+    pub fn single_super(owner: AccountOwner) -> Self {
         ChainOwnership {
-            super_owners: iter::once((Owner::from(public_key), public_key)).collect(),
+            super_owners: iter::once(owner).collect(),
             owners: BTreeMap::new(),
+            first_leader: None,
             multi_leader_rounds: 2,
+            open_multi_leader_rounds: false,
             timeout_config: TimeoutConfig::default(),
         }
     }
 
     /// Creates a `ChainOwnership` with a single regular owner.
-    pub fn single(public_key: PublicKey) -> Self {
+    pub fn single(owner: AccountOwner) -> Self {
         ChainOwnership {
-            super_owners: BTreeMap::new(),
-            owners: iter::once((Owner::from(public_key), (public_key, 100))).collect(),
+            super_owners: BTreeSet::new(),
+            owners: iter::once((owner, 100)).collect(),
+            first_leader: None,
             multi_leader_rounds: 2,
+            open_multi_leader_rounds: false,
             timeout_config: TimeoutConfig::default(),
         }
     }
 
     /// Creates a `ChainOwnership` with the specified regular owners.
     pub fn multiple(
-        keys_and_weights: impl IntoIterator<Item = (PublicKey, u64)>,
+        owners_and_weights: impl IntoIterator<Item = (AccountOwner, u64)>,
         multi_leader_rounds: u32,
         timeout_config: TimeoutConfig,
     ) -> Self {
         ChainOwnership {
-            super_owners: BTreeMap::new(),
-            owners: keys_and_weights
-                .into_iter()
-                .map(|(public_key, weight)| (Owner::from(public_key), (public_key, weight)))
-                .collect(),
+            super_owners: BTreeSet::new(),
+            owners: owners_and_weights.into_iter().collect(),
+            first_leader: None,
             multi_leader_rounds,
+            open_multi_leader_rounds: false,
             timeout_config,
         }
     }
 
     /// Adds a regular owner.
-    pub fn with_regular_owner(mut self, public_key: PublicKey, weight: u64) -> Self {
-        self.owners
-            .insert(Owner::from(public_key), (public_key, weight));
+    pub fn with_regular_owner(mut self, owner: AccountOwner, weight: u64) -> Self {
+        self.owners.insert(owner, weight);
+        self
+    }
+
+    /// Fixes the given owner as the leader of the first single-leader round on all heights.
+    pub fn with_first_leader(mut self, owner: AccountOwner) -> Self {
+        self.first_leader = Some(owner);
         self
     }
 
@@ -113,29 +155,33 @@ impl ChainOwnership {
             || self.timeout_config.fallback_duration == TimeDelta::ZERO
     }
 
-    /// Returns the given owner's public key, if they are an owner or super owner.
-    pub fn verify_owner(&self, owner: &Owner) -> Option<PublicKey> {
-        if let Some(public_key) = self.super_owners.get(owner) {
-            Some(*public_key)
-        } else {
-            self.owners.get(owner).map(|(public_key, _)| *public_key)
-        }
+    /// Returns `true` if this is an owner or super owner.
+    pub fn is_owner(&self, owner: &AccountOwner) -> bool {
+        self.super_owners.contains(owner)
+            || self.owners.contains_key(owner)
+            || self.first_leader.as_ref().is_some_and(|fl| fl == owner)
+    }
+
+    /// Returns `true` if this is an owner or if `open_multi_leader_rounds`.
+    pub fn is_multi_leader_owner(&self, owner: &AccountOwner) -> bool {
+        self.open_multi_leader_rounds
+            || self.owners.contains_key(owner)
+            || self.super_owners.contains(owner)
     }
 
     /// Returns the duration of the given round.
     pub fn round_timeout(&self, round: Round) -> Option<TimeDelta> {
         let tc = &self.timeout_config;
+        if round.is_fast() && self.owners.is_empty() {
+            return None; // Fast round only times out if there are regular owners.
+        }
         match round {
             Round::Fast => tc.fast_round_duration,
             Round::MultiLeader(r) if r.saturating_add(1) == self.multi_leader_rounds => {
                 Some(tc.base_timeout)
             }
             Round::MultiLeader(_) => None,
-            Round::SingleLeader(r) => {
-                let increment = tc.timeout_increment.saturating_mul(u64::from(r));
-                Some(tc.base_timeout.saturating_add(increment))
-            }
-            Round::Validator(r) => {
+            Round::SingleLeader(r) | Round::Validator(r) => {
                 let increment = tc.timeout_increment.saturating_mul(u64::from(r));
                 Some(tc.base_timeout.saturating_add(increment))
             }
@@ -156,15 +202,14 @@ impl ChainOwnership {
     }
 
     /// Returns an iterator over all super owners, followed by all owners.
-    pub fn all_owners(&self) -> impl Iterator<Item = &Owner> {
-        self.super_owners.keys().chain(self.owners.keys())
+    pub fn all_owners(&self) -> impl Iterator<Item = &AccountOwner> {
+        self.super_owners.iter().chain(self.owners.keys())
     }
 
-    /// Returns an iterator over all super owners' keys, followed by all owners'.
-    pub fn all_public_keys(&self) -> impl Iterator<Item = &PublicKey> {
-        self.super_owners
-            .values()
-            .chain(self.owners.values().map(|(public_key, _)| public_key))
+    /// Returns whether fallback mode is enabled on this chain, i.e. the fallback duration
+    /// is less than `TimeDelta::MAX`.
+    pub fn has_fallback(&self) -> bool {
+        self.timeout_config.fallback_duration < TimeDelta::MAX
     }
 
     /// Returns the round following the specified one, if any.
@@ -183,33 +228,56 @@ impl ChainOwnership {
         };
         Some(next_round)
     }
+
+    /// Returns whether the given owner a super owner and there are no regular owners.
+    pub fn is_super_owner_no_regular_owners(&self, owner: &AccountOwner) -> bool {
+        self.owners.is_empty() && self.super_owners.contains(owner)
+    }
 }
 
 /// Errors that can happen when attempting to close a chain.
 #[derive(Clone, Copy, Debug, Error, WitStore, WitType)]
 pub enum CloseChainError {
-    /// Authenticated signer wasn't allowed to close the chain.
+    /// The application wasn't allowed to close the chain.
     #[error("Unauthorized attempt to close the chain")]
     NotPermitted,
+}
+
+/// Errors that can happen when attempting to change the application permissions.
+#[derive(Clone, Copy, Debug, Error, WitStore, WitType)]
+pub enum ChangeApplicationPermissionsError {
+    /// The application wasn't allowed to change the application permissions.
+    #[error("Unauthorized attempt to change the application permissions")]
+    NotPermitted,
+}
+
+/// Errors that can happen when verifying the authentication of an operation over an
+/// account.
+#[derive(Clone, Copy, Debug, Error, WitStore, WitType)]
+pub enum AccountPermissionError {
+    /// Operations on this account are not permitted in the current execution context.
+    #[error("Unauthorized attempt to access account owned by {0}")]
+    NotPermitted(AccountOwner),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{Ed25519SecretKey, Secp256k1SecretKey};
 
     #[test]
     fn test_ownership_round_timeouts() {
-        use crate::crypto::KeyPair;
-
-        let super_pub_key = KeyPair::generate().public();
-        let super_owner = Owner::from(super_pub_key);
-        let pub_key = KeyPair::generate().public();
-        let owner = Owner::from(pub_key);
+        let super_pub_key = Ed25519SecretKey::generate().public();
+        let super_owner = AccountOwner::from(super_pub_key);
+        let pub_key = Secp256k1SecretKey::generate().public();
+        let owner = AccountOwner::from(pub_key);
 
         let ownership = ChainOwnership {
-            super_owners: BTreeMap::from_iter([(super_owner, super_pub_key)]),
-            owners: BTreeMap::from_iter([(owner, (pub_key, 100))]),
+            super_owners: BTreeSet::from_iter([super_owner]),
+            owners: BTreeMap::from_iter([(owner, 100)]),
+            first_leader: Some(owner),
             multi_leader_rounds: 10,
+            open_multi_leader_rounds: false,
             timeout_config: TimeoutConfig {
                 fast_round_duration: Some(TimeDelta::from_secs(5)),
                 base_timeout: TimeDelta::from_secs(10),

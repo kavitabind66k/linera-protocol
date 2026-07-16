@@ -6,9 +6,9 @@
 mod state;
 
 use amm::{AmmAbi, Message, Operation, Parameters};
-use fungible::{Account, FungibleTokenAbi};
 use linera_sdk::{
-    base::{AccountOwner, Amount, ApplicationId, ChainId, WithContractAbi},
+    abis::fungible::{FungibleOperation, FungibleResponse, FungibleTokenAbi},
+    linera_base_types::{Account, AccountOwner, Amount, ApplicationId, ChainId, WithContractAbi},
     views::{RootView, View},
     Contract, ContractRuntime,
 };
@@ -32,6 +32,7 @@ impl Contract for AmmContract {
     type Message = Message;
     type InstantiationArgument = ();
     type Parameters = Parameters;
+    type EventValue = ();
 
     async fn load(runtime: ContractRuntime<Self>) -> Self {
         let state = AmmState::load(runtime.root_view_storage_context())
@@ -66,11 +67,13 @@ impl Contract for AmmContract {
                 input_token_idx,
                 input_amount,
             } => {
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for Swap message");
                 // It's assumed that the tokens have already been transferred here at this point
                 assert!(
                     input_amount > Amount::ZERO,
-                    "You can't add liquidity with zero tokens"
+                    "You can't swap with zero tokens"
                 );
 
                 assert!(input_token_idx < 2, "Invalid token index");
@@ -103,7 +106,9 @@ impl Contract for AmmContract {
                 max_token0_amount,
                 max_token1_amount,
             } => {
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for AddLiquidity message");
 
                 assert!(
                     max_token0_amount > Amount::ZERO && max_token1_amount > Amount::ZERO,
@@ -220,7 +225,9 @@ impl Contract for AmmContract {
                 token_to_remove_idx,
                 mut token_to_remove_amount,
             } => {
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for RemoveLiquidity message");
 
                 assert!(token_to_remove_idx < 2, "Invalid token index");
 
@@ -283,7 +290,9 @@ impl Contract for AmmContract {
             }
 
             Message::RemoveAllAddedLiquidity { owner } => {
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for RemoveAllAddedLiquidity message");
 
                 let message_origin_account = self.get_message_origin_account(owner);
                 let current_shares = self
@@ -309,26 +318,6 @@ impl Contract for AmmContract {
 }
 
 impl AmmContract {
-    /// authenticate the originator of the message
-    fn check_account_authentication(&mut self, owner: AccountOwner) {
-        match owner {
-            AccountOwner::User(address) => {
-                assert_eq!(
-                    self.runtime.authenticated_signer(),
-                    Some(address),
-                    "Unauthorized"
-                )
-            }
-            AccountOwner::Application(id) => {
-                assert_eq!(
-                    self.runtime.authenticated_caller_id(),
-                    Some(id),
-                    "Unauthorized"
-                )
-            }
-        }
-    }
-
     /// Obtains the current shares for an `account`.
     async fn current_shares_or_default(&self, account: &Account) -> Amount {
         self.state
@@ -440,7 +429,7 @@ impl AmmContract {
     }
 
     fn get_amm_app_owner(&mut self) -> AccountOwner {
-        AccountOwner::Application(self.runtime.application_id().forget_abi())
+        self.runtime.application_id().into()
     }
 
     fn get_amm_chain_id(&mut self) -> ChainId {
@@ -454,16 +443,12 @@ impl AmmContract {
         }
     }
 
-    fn get_message_creation_chain_id(&mut self) -> ChainId {
-        self.runtime
-            .message_id()
-            .expect("Getting message id should not fail")
-            .chain_id
-    }
-
     fn get_message_origin_account(&mut self, owner: AccountOwner) -> Account {
         Account {
-            chain_id: self.get_message_creation_chain_id(),
+            chain_id: self
+                .runtime
+                .message_origin_chain_id()
+                .expect("Getting message origin chain ID should not fail"),
             owner,
         }
     }
@@ -542,7 +527,9 @@ impl AmmContract {
                 input_token_idx,
                 input_amount,
             } => {
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for Swap operation");
 
                 let account_on_amm_chain = self.get_account_on_amm_chain(owner);
                 self.transfer(owner, input_amount, account_on_amm_chain, input_token_idx);
@@ -564,7 +551,9 @@ impl AmmContract {
                 max_token0_amount,
                 max_token1_amount,
             } => {
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for AddLiquidity operation");
 
                 let account_on_amm_chain = self.get_account_on_amm_chain(owner);
                 self.transfer(owner, max_token0_amount, account_on_amm_chain, 0);
@@ -589,7 +578,9 @@ impl AmmContract {
                 token_to_remove_idx,
                 token_to_remove_amount,
             } => {
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for RemoveLiquidity operation");
 
                 let message = Message::RemoveLiquidity {
                     owner,
@@ -603,7 +594,9 @@ impl AmmContract {
             }
 
             Operation::RemoveAllAddedLiquidity { owner } => {
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for RemoveAllAddedLiquidity operation");
 
                 let message = Message::RemoveAllAddedLiquidity { owner };
                 self.runtime
@@ -660,7 +653,7 @@ impl AmmContract {
     }
 
     fn get_pool_balance(&mut self, token_idx: u32) -> Amount {
-        let pool_owner = AccountOwner::Application(self.runtime.application_id().forget_abi());
+        let pool_owner = self.runtime.application_id().into();
         self.balance(&pool_owner, token_idx)
     }
 
@@ -676,7 +669,7 @@ impl AmmContract {
         token_idx: u32,
     ) {
         let token = self.fungible_id(token_idx);
-        let operation = fungible::Operation::Transfer {
+        let operation = FungibleOperation::Transfer {
             owner: source_owner,
             amount,
             target_account,
@@ -686,10 +679,10 @@ impl AmmContract {
     }
 
     fn balance(&mut self, owner: &AccountOwner, token_idx: u32) -> Amount {
-        let balance = fungible::Operation::Balance { owner: *owner };
+        let balance = FungibleOperation::Balance { owner: *owner };
         let token = self.fungible_id(token_idx);
         match self.runtime.call_application(true, token, &balance) {
-            fungible::FungibleResponse::Balance(balance) => balance,
+            FungibleResponse::Balance(balance) => balance,
             response => panic!("Unexpected response from fungible token application: {response:?}"),
         }
     }

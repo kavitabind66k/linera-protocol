@@ -10,14 +10,17 @@
 use std::{collections::BTreeMap, str::FromStr, sync::LazyLock, time::Duration};
 
 use fungible::{FungibleTokenAbi, InitialState};
-use linera_base::{data_types::Amount, identifiers::ChainId};
+use linera_base::{
+    data_types::Amount,
+    identifiers::{Account, AccountOwner, ChainId},
+    vm::VmRuntime,
+};
 use linera_service::cli_wrappers::{
     local_net::{Database, LocalNetConfig, ProcessInbox},
     LineraNet, LineraNetConfig, Network,
 };
 use linera_service_graphql_client::{
-    applications, block, blocks, chains, request, transfer, Applications, Block, Blocks, Chains,
-    Transfer,
+    block, blocks, chains, request, transfer, Block, Blocks, Chains, Transfer,
 };
 use test_case::test_case;
 use tokio::sync::Mutex;
@@ -32,10 +35,14 @@ fn reqwest_client() -> reqwest::Client {
         .unwrap()
 }
 
-async fn transfer(client: &reqwest::Client, url: &str, from: ChainId, to: ChainId, amount: &str) {
+async fn transfer(client: &reqwest::Client, url: &str, from: ChainId, to: Account, amount: &str) {
     let variables = transfer::Variables {
         chain_id: from,
-        recipient: to,
+        owner: AccountOwner::CHAIN,
+        recipient: transfer::Account {
+            chain_id: to.chain_id,
+            owner: to.owner,
+        },
         amount: Amount::from_str(amount).unwrap(),
     };
     request::<Transfer, _>(client, url, variables)
@@ -47,81 +54,67 @@ async fn transfer(client: &reqwest::Client, url: &str, from: ChainId, to: ChainI
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "dynamodb_grpc"))]
 #[test_log::test(tokio::test)]
-async fn test_end_to_end_queries(config: impl LineraNetConfig) {
+async fn test_end_to_end_queries(config: impl LineraNetConfig) -> anyhow::Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
 
-    let (mut net, client) = config.instantiate().await.unwrap();
+    let (mut net, client) = config.instantiate().await?;
+    let owner = client.get_owner().unwrap();
 
-    let node_chains = {
-        let wallet = client.load_wallet().unwrap();
+    let mut node_chains = {
+        let wallet = client.load_wallet()?;
         (wallet.default_chain(), wallet.chain_ids())
     };
-    let chain_id = node_chains.0.unwrap();
+    node_chains.1.sort();
+    let chain0 = node_chains.0.unwrap();
 
     // publishing an application
-    let (contract, service) = client.build_example("fungible").await.unwrap();
-    let state = InitialState {
-        accounts: BTreeMap::new(),
-    };
+    let (contract, service) = client.build_example("fungible").await?;
+    let vm_runtime = VmRuntime::Wasm;
+    let accounts = BTreeMap::from([(owner, Amount::from_tokens(9))]);
+    let state = InitialState { accounts };
     let params = fungible::Parameters::new("FUN");
-    let application_id = client
+    let _application_id = client
         .publish_and_create::<FungibleTokenAbi, fungible::Parameters, InitialState>(
             contract,
             service,
+            vm_runtime,
             &params,
             &state,
             &[],
             None,
         )
-        .await
-        .unwrap();
+        .await?;
 
     let mut node_service = client
         .run_node_service(None, ProcessInbox::Automatic)
-        .await
-        .unwrap();
+        .await?;
     let req_client = &reqwest_client();
     let url = &format!("http://localhost:{}/", node_service.port());
 
     // sending a few transfers
-    let chain0 = ChainId::root(0);
-    let chain1 = ChainId::root(1);
+    let chain1 = Account::chain(node_chains.1[1]);
     for _ in 0..10 {
         transfer(req_client, url, chain0, chain1, "0.1").await;
     }
 
     // check chains query
-    let chains = request::<Chains, _>(req_client, url, chains::Variables)
-        .await
-        .unwrap()
+    let mut chains = request::<Chains, _>(req_client, url, chains::Variables)
+        .await?
         .chains;
+    chains.list.sort();
     assert_eq!((chains.default, chains.list), node_chains);
-
-    // check applications query
-    let applications = request::<Applications, _>(
-        req_client,
-        url,
-        applications::Variables {
-            chain_id: node_chains.0.unwrap(),
-        },
-    )
-    .await
-    .unwrap()
-    .applications;
-    assert_eq!(applications[0].id, application_id.forget_abi().to_string());
 
     // check blocks query
     let blocks = request::<Blocks, _>(
         req_client,
         url,
         blocks::Variables {
-            chain_id,
+            chain_id: chain0,
             from: None,
             limit: None,
         },
     )
-    .await
-    .unwrap()
+    .await?
     .blocks;
     assert_eq!(blocks.len(), 10);
 
@@ -130,14 +123,14 @@ async fn test_end_to_end_queries(config: impl LineraNetConfig) {
         &reqwest_client(),
         &format!("http://localhost:{}/", node_service.port()),
         block::Variables {
-            chain_id,
+            chain_id: chain0,
             hash: None,
         },
     )
-    .await
-    .unwrap()
+    .await?
     .block;
 
-    node_service.ensure_is_running().unwrap();
-    net.terminate().await.unwrap();
+    node_service.ensure_is_running()?;
+    net.terminate().await?;
+    Ok(())
 }

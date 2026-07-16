@@ -3,7 +3,7 @@
 
 use linera_base::{
     crypto::CryptoHash,
-    data_types::BlobContent,
+    data_types::{BlobContent, BlockHeight, NetworkDescription},
     identifiers::{BlobId, ChainId},
 };
 use linera_chain::{
@@ -43,6 +43,14 @@ impl From<SimpleClient> for Client {
 
 impl ValidatorNode for Client {
     type NotificationStream = NotificationStream;
+
+    fn address(&self) -> String {
+        match self {
+            Client::Grpc(grpc_client) => grpc_client.address().to_string(),
+            #[cfg(with_simple_network)]
+            Client::Simple(simple_client) => simple_client.address(),
+        }
+    }
 
     async fn handle_block_proposal(
         &self,
@@ -160,12 +168,12 @@ impl ValidatorNode for Client {
         })
     }
 
-    async fn get_genesis_config_hash(&self) -> Result<CryptoHash, NodeError> {
+    async fn get_network_description(&self) -> Result<NetworkDescription, NodeError> {
         Ok(match self {
-            Client::Grpc(grpc_client) => grpc_client.get_genesis_config_hash().await?,
+            Client::Grpc(grpc_client) => grpc_client.get_network_description().await?,
 
             #[cfg(with_simple_network)]
-            Client::Simple(simple_client) => simple_client.get_genesis_config_hash().await?,
+            Client::Simple(simple_client) => simple_client.get_network_description().await?,
         })
     }
 
@@ -245,6 +253,28 @@ impl ValidatorNode for Client {
         })
     }
 
+    async fn download_certificates_by_heights(
+        &self,
+        chain_id: ChainId,
+        mut heights: Vec<BlockHeight>,
+    ) -> Result<Vec<ConfirmedBlockCertificate>, NodeError> {
+        heights.sort();
+        Ok(match self {
+            Client::Grpc(grpc_client) => {
+                grpc_client
+                    .download_certificates_by_heights(chain_id, heights)
+                    .await?
+            }
+
+            #[cfg(with_simple_network)]
+            Client::Simple(simple_client) => {
+                simple_client
+                    .download_certificates_by_heights(chain_id, heights)
+                    .await?
+            }
+        })
+    }
+
     async fn blob_last_used_by(&self, blob_id: BlobId) -> Result<CryptoHash, NodeError> {
         Ok(match self {
             Client::Grpc(grpc_client) => grpc_client.blob_last_used_by(blob_id).await?,
@@ -254,12 +284,38 @@ impl ValidatorNode for Client {
         })
     }
 
+    async fn blob_last_used_by_certificate(
+        &self,
+        blob_id: BlobId,
+    ) -> Result<ConfirmedBlockCertificate, NodeError> {
+        Ok(match self {
+            Client::Grpc(grpc_client) => grpc_client.blob_last_used_by_certificate(blob_id).await?,
+
+            #[cfg(with_simple_network)]
+            Client::Simple(simple_client) => {
+                simple_client.blob_last_used_by_certificate(blob_id).await?
+            }
+        })
+    }
+
     async fn missing_blob_ids(&self, blob_ids: Vec<BlobId>) -> Result<Vec<BlobId>, NodeError> {
         Ok(match self {
             Client::Grpc(grpc_client) => grpc_client.missing_blob_ids(blob_ids).await?,
 
             #[cfg(with_simple_network)]
             Client::Simple(simple_client) => simple_client.missing_blob_ids(blob_ids).await?,
+        })
+    }
+
+    async fn get_shard_info(
+        &self,
+        chain_id: ChainId,
+    ) -> Result<linera_core::data_types::ShardInfo, NodeError> {
+        Ok(match self {
+            Client::Grpc(grpc_client) => grpc_client.get_shard_info(chain_id).await?,
+
+            #[cfg(with_simple_network)]
+            Client::Simple(simple_client) => simple_client.get_shard_info(chain_id).await?,
         })
     }
 }

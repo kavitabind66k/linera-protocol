@@ -23,11 +23,7 @@ use gql_service::{
 };
 use graphql_client::Response;
 use js_utils::{getf, log_str, parse, setf, stringify, SER};
-use linera_base::{
-    crypto::CryptoHash,
-    data_types::BlockHeight,
-    identifiers::{ChainDescription, ChainId},
-};
+use linera_base::{crypto::CryptoHash, data_types::BlockHeight, identifiers::ChainId};
 use linera_indexer_graphql_client::{
     indexer::{plugins, Plugins},
     operations as gql_operations,
@@ -63,7 +59,7 @@ pub(crate) fn reqwest_client() -> reqwest::Client {
 enum Page {
     Unloaded,
     Home {
-        chain: Chain,
+        chain: Box<Chain>,
         blocks: Vec<Blocks>,
         apps: Vec<Application>,
     },
@@ -103,10 +99,11 @@ impl Config {
             node: "localhost:8080".to_string(),
             tls: false,
         };
-        match web_sys::window()
-            .expect("window object not found")
-            .local_storage()
-        {
+        // Return default if window doesn't exist (e.g., in test environment).
+        let Some(window) = web_sys::window() else {
+            return default;
+        };
+        match window.local_storage() {
             Ok(Some(st)) => match st.get_item("config") {
                 Ok(Some(s)) => serde_json::from_str::<Config>(&s).unwrap_or(default),
                 _ => default,
@@ -133,7 +130,10 @@ pub fn data() -> JsValue {
         config: Config::load(),
         page: Page::Unloaded,
         chains: Vec::new(),
-        chain: ChainId::from(ChainDescription::Root(0)),
+        chain: ChainId::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap(),
         plugins: Vec::new(),
     };
     data.serialize(&SER).unwrap()
@@ -171,11 +171,10 @@ fn url(config: &Config, protocol: Protocol, kind: AddressKind) -> String {
     format!("{}{}://{}", protocol, tls, address)
 }
 
-async fn get_chain(node: &str, chain_id: ChainId) -> Result<Chain> {
+async fn get_chain(node: &str, chain_id: ChainId) -> Result<Box<Chain>> {
     let client = reqwest::Client::new();
     let variables = chain::Variables {
         chain_id,
-        channels_input: None,
         inboxes_input: None,
         outboxes_input: None,
     };
@@ -183,7 +182,7 @@ async fn get_chain(node: &str, chain_id: ChainId) -> Result<Chain> {
         .await?
         .chain;
     log_str(&serde_json::to_string_pretty(&chain).unwrap());
-    Ok(chain)
+    Ok(Box::new(chain))
 }
 
 async fn get_blocks(
@@ -284,10 +283,10 @@ async fn chains(app: &JsValue, node: &str) -> Result<ChainId> {
         .serialize(&SER)
         .expect("failed to serialize ChainIds");
     setf(app, "chains", &chains_js);
-    Ok(chains.default.unwrap_or_else(|| match chains.list.first() {
-        None => ChainId::from(ChainDescription::Root(0)),
-        Some(chain_id) => *chain_id,
-    }))
+    chains
+        .default
+        .or_else(|| chains.list.first().copied())
+        .ok_or_else(|| anyhow::Error::msg("no chains available"))
 }
 
 /// Queries indexer plugins.
@@ -312,7 +311,7 @@ async fn applications(node: &str, chain_id: ChainId) -> Result<(Page, String)> {
     ))
 }
 
-/// Returns the applications page.
+/// Returns the operations page.
 async fn operations(indexer: &str, chain_id: ChainId) -> Result<(Page, String)> {
     let operations = get_operations(indexer, chain_id).await?;
     Ok((

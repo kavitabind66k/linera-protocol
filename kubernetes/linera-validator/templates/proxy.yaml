@@ -16,7 +16,7 @@ spec:
       name: metrics
   selector:
     app: proxy
-  type: NodePort
+  clusterIP: None
 
 ---
 apiVersion: v1
@@ -24,42 +24,71 @@ kind: Service
 metadata:
   name: proxy-internal
   labels:
-    app: proxy-internal
+    app: proxy
 spec:
   ports:
     - port: 20100
-      name: linera-port-int
-      targetPort: 20100
+      name: proxy-internal
+  clusterIP: None
   selector:
     app: proxy
-  type: NodePort
-
 ---
+
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: proxy
 spec:
+  serviceName: "proxy-internal"
   selector:
     matchLabels:
       app: proxy
-  replicas: 1
+  replicas: {{ .Values.numProxies }}
+  podManagementPolicy: Parallel
   template:
     metadata:
       labels:
         app: proxy
     spec:
+      {{- if eq .Values.environment "GCP" }}
+      nodeSelector:
+        workload: proxies
+      tolerations:
+      - key: proxies
+        value: "true"
+        effect: NoSchedule
+      {{- end }}
       terminationGracePeriodSeconds: 10
       initContainers:
         - name: linera-proxy-initializer
           image: {{ .Values.lineraImage }}
           imagePullPolicy: {{ .Values.lineraImagePullPolicy }}
-          command: ["./proxy-init.sh"]
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                ./linera storage check-existence --storage "scylladb:tcp:scylla-client.scylla.svc.cluster.local:9042"
+                status=$?
+                if [ "$status" -eq 0 ]; then
+                  echo "Database already exists, no need to initialize."
+                  exit 0
+                else
+                  if [ "$status" -eq 1 ]; then
+                    echo "Database does not exist, retrying in 5 seconds..."
+                  else
+                    echo "An unexpected error occurred (status: $status), retrying in 5 seconds..."
+                  fi
+                  sleep 5
+                fi
+              done
           env:
             - name: RUST_LOG
               value: {{ .Values.logLevel }}
             - name: RUST_BACKTRACE
               value: "1"
+            - name: LINERA_OTLP_EXPORTER_ENDPOINT
+              value: {{ .Values.otlpExporterEndpoint }}
       containers:
         - name: linera-proxy
           imagePullPolicy: {{ .Values.lineraImagePullPolicy }}
@@ -68,19 +97,29 @@ spec:
             - containerPort: {{ .Values.proxyPort }}
               name: linera-port
             - containerPort: 20100
-              name: linera-port-int
+              name: private-port
           command:
-            [
-              "./linera-proxy",
-              "--storage",
-              "scylladb:tcp:scylla-client.scylla.svc.cluster.local:9042",
-              "--genesis",
-              "/config/genesis.json",
-            ]
-          args: ["/config/server.json"]
+            - sh
+            - -c
+            - |
+              ORDINAL="${HOSTNAME##*-}"
+              exec ./linera-proxy \
+                --storage scylladb:tcp:scylla-client.scylla.svc.cluster.local:9042 \
+                --storage-replication-factor {{ .Values.storageReplicationFactor | quote }} \
+                --id "$ORDINAL" \
+                /config/server.json
           env:
             - name: RUST_LOG
               value: {{ .Values.logLevel }}
+            - name: LINERA_OTLP_EXPORTER_ENDPOINT
+              value: {{ .Values.otlpExporterEndpoint }}
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.proxyPort }}
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
           volumeMounts:
             - name: config
               mountPath: "/config"

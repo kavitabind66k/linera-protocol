@@ -6,36 +6,34 @@
     feature = "dynamodb",
     feature = "scylladb",
     feature = "storage-service",
-    feature = "kubernetes",
     feature = "remote-net"
 ))]
 
-mod common;
+mod guard;
 
-use std::{
-    env,
-    time::{Duration, Instant},
-};
+use std::env;
 
 use anyhow::Result;
 use async_graphql::InputType;
-use common::INTEGRATION_TEST_GUARD;
 use futures::{
     channel::mpsc,
     future::{self, Either},
-    SinkExt, StreamExt,
+    StreamExt,
 };
+use guard::INTEGRATION_TEST_GUARD;
+#[cfg(with_revm)]
+use linera_base::vm::{EvmInstantiation, EvmOperation, EvmQuery};
 use linera_base::{
-    command::resolve_binary,
-    crypto::CryptoHash,
+    crypto::{CryptoHash, Secp256k1SecretKey},
     data_types::Amount,
     identifiers::{Account, AccountOwner, ApplicationId, ChainId},
+    time::{Duration, Instant},
+    vm::VmRuntime,
 };
-use linera_chain::data_types::{Medium, Origin};
 use linera_core::worker::{Notification, Reason};
 use linera_sdk::{
-    base::{BlobContent, BlockHeight},
-    DataBlobHash,
+    abis::fungible::FungibleTokenAbi,
+    linera_base_types::{AccountSecretKey, BlobContent, BlockHeight, DataBlobHash},
 };
 #[cfg(any(
     feature = "dynamodb",
@@ -43,28 +41,50 @@ use linera_sdk::{
     feature = "storage-service",
 ))]
 use linera_service::cli_wrappers::local_net::{Database, LocalNetConfig};
-#[cfg(feature = "remote-net")]
-use linera_service::cli_wrappers::remote_net::RemoteNetTestingConfig;
 #[cfg(any(
     feature = "dynamodb",
     feature = "scylladb",
     feature = "storage-service",
-    feature = "kubernetes",
 ))]
 use linera_service::cli_wrappers::Network;
-#[cfg(feature = "kubernetes")]
-use linera_service::cli_wrappers::{
-    docker::BuildArg, local_kubernetes_net::SharedLocalKubernetesNetTestingConfig,
-};
+#[cfg(feature = "remote-net")]
+use linera_service::cli_wrappers::{remote_net::RemoteNetTestingConfig, OnClientDrop::*};
 use linera_service::{
     cli_wrappers::{
         local_net::{get_node_port, ProcessInbox},
-        ApplicationWrapper, ClientWrapper, FaucetOption, LineraNet, LineraNetConfig,
+        ApplicationWrapper, ClientWrapper, LineraNet, LineraNetConfig, NotificationsExt,
     },
     test_name,
 };
 use serde_json::{json, Value};
 use test_case::test_case;
+#[cfg(with_revm)]
+use {
+    alloy_primitives::{Address, Bytes, Log, B256, U256},
+    alloy_sol_types::{sol, SolCall, SolValue},
+    linera_execution::test_utils::solidity::{
+        get_evm_contract_path, load_solidity_example_by_name, read_evm_address_entry,
+        read_evm_u256_entry, read_evm_u64_entry, temporary_write_evm_module,
+    },
+    linera_sdk::abis::evm::EvmAbi,
+};
+
+#[cfg(with_revm)]
+async fn assert_contract_balance(
+    app: &ApplicationWrapper<EvmAbi>,
+    address: Address,
+    balance: Amount,
+) -> anyhow::Result<()> {
+    sol! {
+        function get_balance(address account);
+    }
+    let query = get_balanceCall { account: address };
+    let query = EvmQuery::Query(query.abi_encode());
+    let result = app.run_json_query(query).await?;
+    let balance_256: U256 = balance.into();
+    assert_eq!(read_evm_u256_entry(result), balance_256);
+    Ok(())
+}
 
 /// The environment variable name to specify the number of iterations in the performance-related
 /// tests.
@@ -82,55 +102,13 @@ fn test_iterations() -> Option<usize> {
     }
 }
 
-fn get_fungible_account_owner(client: &ClientWrapper) -> AccountOwner {
-    let owner = client.get_owner().unwrap();
-    AccountOwner::User(owner)
+fn get_account_owner(client: &ClientWrapper) -> AccountOwner {
+    client.get_owner().unwrap()
 }
 
-#[cfg(feature = "ethereum")]
-struct EthereumTrackerApp(ApplicationWrapper<ethereum_tracker::EthereumTrackerAbi>);
+struct NativeFungibleApp(ApplicationWrapper<FungibleTokenAbi>);
 
-#[cfg(feature = "ethereum")]
-use alloy::primitives::U256;
-
-#[cfg(feature = "ethereum")]
-impl EthereumTrackerApp {
-    async fn get_amount(&self, account_owner: &str) -> U256 {
-        use ethereum_tracker::U256Cont;
-        let query = format!(
-            "accounts {{ entry(key: \"{}\") {{ value }} }}",
-            account_owner
-        );
-        let response_body = self.0.query(&query).await.unwrap();
-        let amount_option = serde_json::from_value::<Option<U256Cont>>(
-            response_body["accounts"]["entry"]["value"].clone(),
-        )
-        .unwrap();
-        match amount_option {
-            None => U256::from(0),
-            Some(value) => {
-                let U256Cont { value } = value;
-                value
-            }
-        }
-    }
-
-    async fn assert_balances(&self, accounts: impl IntoIterator<Item = (String, U256)>) {
-        for (account_owner, amount) in accounts {
-            let value = self.get_amount(&account_owner).await;
-            assert_eq!(value, amount);
-        }
-    }
-
-    async fn update(&self, to_block: u64) {
-        let mutation = format!("update(toBlock: {})", to_block);
-        self.0.mutate(mutation).await.unwrap();
-    }
-}
-
-struct FungibleApp(ApplicationWrapper<fungible::FungibleTokenAbi>);
-
-impl FungibleApp {
+impl NativeFungibleApp {
     async fn get_amount(&self, account_owner: &AccountOwner) -> Amount {
         let query = format!(
             "accounts {{ entry(key: {}) {{ value }} }}",
@@ -188,7 +166,7 @@ impl FungibleApp {
         &self,
         account_owner: &AccountOwner,
         amount_transfer: Amount,
-        destination: fungible::Account,
+        destination: Account,
     ) -> Value {
         let mutation = format!(
             "transfer(owner: {}, amount: \"{}\", targetAccount: {})",
@@ -199,7 +177,24 @@ impl FungibleApp {
         self.0.mutate(mutation).await.unwrap()
     }
 
-    async fn claim(&self, source: fungible::Account, target: fungible::Account, amount: Amount) {
+    async fn repeated_transfer(
+        &self,
+        account_owner: &AccountOwner,
+        amount_transfer: Amount,
+        destination: Account,
+        num_operations: usize,
+    ) -> Value {
+        let mutation = format!(
+            "transfer(owner: {}, amount: \"{}\", targetAccount: {})",
+            account_owner.to_value(),
+            amount_transfer,
+            destination.to_value(),
+        );
+        let mutations = vec![mutation; num_operations];
+        self.0.multiple_mutate(&mutations).await.unwrap()
+    }
+
+    async fn claim(&self, source: Account, target: Account, amount: Amount) {
         // Claiming tokens from chain1 to chain2.
         let mutation = format!(
             "claim(sourceAccount: {}, amount: \"{}\", targetAccount: {})",
@@ -209,6 +204,103 @@ impl FungibleApp {
         );
 
         self.0.mutate(mutation).await.unwrap();
+    }
+}
+
+struct FungibleApp(ApplicationWrapper<fungible::FungibleTokenAbi>);
+
+impl FungibleApp {
+    async fn get_amount(&self, account_owner: &AccountOwner) -> Amount {
+        let query = format!(
+            "accounts {{ entry(key: {}) {{ value }} }}",
+            account_owner.to_value()
+        );
+        let response_body = self.0.query(&query).await.unwrap();
+        let amount_option = serde_json::from_value::<Option<Amount>>(
+            response_body["accounts"]["entry"]["value"].clone(),
+        )
+        .unwrap();
+
+        amount_option.unwrap_or(Amount::ZERO)
+    }
+
+    async fn assert_balances(&self, accounts: impl IntoIterator<Item = (AccountOwner, Amount)>) {
+        for (account_owner, amount) in accounts {
+            let value = self.get_amount(&account_owner).await;
+            assert_eq!(value, amount);
+        }
+    }
+
+    async fn get_allowance(&self, owner: &AccountOwner, spender: &AccountOwner) -> Amount {
+        let owner_spender = fungible::OwnerSpender::new(*owner, *spender);
+        let query = format!(
+            "allowances {{ entry(key: {}) {{ value }} }}",
+            owner_spender.to_value()
+        );
+        let response_body = self.0.query(&query).await.unwrap();
+        let amount_option = serde_json::from_value::<Option<Amount>>(
+            response_body["allowances"]["entry"]["value"].clone(),
+        )
+        .unwrap();
+
+        amount_option.unwrap_or(Amount::ZERO)
+    }
+
+    async fn assert_allowance(
+        &self,
+        owner: &AccountOwner,
+        spender: &AccountOwner,
+        allowance: Amount,
+    ) {
+        let value = self.get_allowance(owner, spender).await;
+        assert_eq!(value, allowance);
+    }
+
+    async fn approve(
+        &self,
+        owner: &AccountOwner,
+        spender: &AccountOwner,
+        allowance: Amount,
+    ) -> Value {
+        let mutation = format!(
+            "approve(owner: {}, spender: {}, allowance: \"{}\")",
+            owner.to_value(),
+            spender.to_value(),
+            allowance,
+        );
+        self.0.mutate(mutation).await.unwrap()
+    }
+
+    async fn transfer(
+        &self,
+        account_owner: &AccountOwner,
+        amount_transfer: Amount,
+        destination: Account,
+    ) -> Value {
+        let mutation = format!(
+            "transfer(owner: {}, amount: \"{}\", targetAccount: {})",
+            account_owner.to_value(),
+            amount_transfer,
+            destination.to_value(),
+        );
+        self.0.mutate(mutation).await.unwrap()
+    }
+
+    async fn transfer_from(
+        &self,
+        owner: &AccountOwner,
+        spender: &AccountOwner,
+        amount_transfer: Amount,
+        destination: Account,
+    ) -> Value {
+        let mutation = format!(
+            "transferFrom(owner: {}, spender: {}, amount: \"{}\", targetAccount: {})",
+            owner.to_value(),
+            spender.to_value(),
+            amount_transfer,
+            destination.to_value(),
+        );
+        self.0.mutate(mutation).await.unwrap()
     }
 }
 
@@ -267,7 +359,7 @@ impl NonFungibleApp {
         &self,
         source_owner: &AccountOwner,
         token_id: &String,
-        target_account: &fungible::Account,
+        target_account: &Account,
     ) -> Value {
         let mutation = format!(
             "transfer(sourceOwner: {}, tokenId: {}, targetAccount: {})",
@@ -280,9 +372,9 @@ impl NonFungibleApp {
 
     async fn claim(
         &self,
-        source_account: &fungible::Account,
+        source_account: &Account,
         token_id: &String,
-        target_account: &fungible::Account,
+        target_account: &Account,
     ) -> Value {
         // Claiming tokens from chain1 to chain2.
         let mutation = format!(
@@ -372,102 +464,87 @@ impl AmmApp {
     }
 }
 
-#[cfg(feature = "ethereum")]
+#[cfg(with_revm)]
+fn get_zero_operation(operation: impl alloy_sol_types::SolCall) -> Result<EvmQuery, bcs::Error> {
+    let operation = EvmOperation::new(Amount::ZERO, operation.abi_encode());
+    operation.to_evm_query()
+}
+
+#[cfg(with_revm)]
+fn get_zero_operations(
+    operation: impl alloy_sol_types::SolCall,
+    num_operations: usize,
+) -> Result<EvmQuery, bcs::Error> {
+    let operation = EvmOperation::new(Amount::ZERO, operation.abi_encode());
+    let operations = vec![operation.to_bytes()?; num_operations];
+    Ok(EvmQuery::Operations(operations))
+}
+
+#[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
-async fn test_wasm_end_to_end_ethereum_tracker(config: impl LineraNetConfig) -> Result<()> {
-    use ethereum_tracker::{EthereumTrackerAbi, InstantiationArgument};
-    use linera_ethereum::{
-        client::EthereumQueries,
-        test_utils::{get_anvil, SimpleTokenContractFunction},
-    };
+async fn test_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
 
-    // Setting up the Ethereum smart contract
-    let anvil_test = get_anvil().await?;
-    let address0 = anvil_test.get_address(0);
-    let address1 = anvil_test.get_address(1);
-    let ethereum_endpoint = anvil_test.endpoint.clone();
-    let ethereum_client = anvil_test.ethereum_client.clone();
-
-    let simple_token = SimpleTokenContractFunction::new(anvil_test).await?;
-    let contract_address = simple_token.contract_address.clone();
-    let event_name_expanded = "Initial(address,uint256)";
-    let events = ethereum_client
-        .read_events(&contract_address, event_name_expanded, 0, 2)
-        .await?;
-    let start_block = events.first().unwrap().block_number;
-    let argument = InstantiationArgument {
-        ethereum_endpoint,
-        contract_address,
-        start_block,
-    };
-
-    // Setting up the validators
     let (mut net, client) = config.instantiate().await?;
+
+    sol! {
+        struct ConstructorArgs {
+            uint64 initial_value;
+        }
+        function increment(uint64 input);
+        function get_value();
+    }
+
+    let original_counter_value = 35;
+    let constructor_argument = ConstructorArgs {
+        initial_value: original_counter_value,
+    };
+    let constructor_argument = constructor_argument.abi_encode();
+
+    let increment = 5;
+
     let chain = client.load_wallet()?.default_chain().unwrap();
 
-    // Change the ownership so that the blocks inserted are not
-    // fast blocks. Fast blocks are not allowed for the oracles.
-    let pub_key1 = {
-        let wallet = client.load_wallet()?;
-        let user_chain = wallet.get(chain).unwrap();
-        user_chain.key_pair.as_ref().unwrap().public()
-    };
-    client
-        .change_ownership(chain, vec![], vec![pub_key1])
-        .await?;
+    let (evm_contract, _dir) = get_evm_contract_path("tests/fixtures/evm_example_counter.sol")?;
 
-    let (contract, service) = client.build_example("ethereum-tracker").await?;
-
+    let instantiation_argument = EvmInstantiation::default();
     let application_id = client
-        .publish_and_create::<EthereumTrackerAbi, (), InstantiationArgument>(
-            contract,
-            service,
-            &(),
-            &argument,
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            evm_contract.clone(),
+            evm_contract,
+            VmRuntime::Evm,
+            &constructor_argument,
+            &instantiation_argument,
             &[],
             None,
         )
         .await?;
+
     let port = get_node_port().await;
     let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
 
-    let app = EthereumTrackerApp(
-        node_service
-            .make_application(&chain, &application_id)
-            .await?,
-    );
+    let application = node_service.make_application(&chain, &application_id)?;
 
-    // Check after the initialization
+    let query = get_valueCall {};
+    let query = query.abi_encode();
+    let query = EvmQuery::Query(query);
+    let result = application.run_json_query(query.clone()).await?;
 
-    app.assert_balances([
-        (address0.clone(), U256::from(1000)),
-        (address1.clone(), U256::from(0)),
-    ])
-    .await;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, original_counter_value);
 
-    // Doing a transfer and updating the smart contract
-    // First await gets you the pending transaction, second gets it mined.
+    let operation = incrementCall { input: increment };
+    let operation = get_zero_operation(operation)?;
+    application.run_json_query(operation).await?;
 
-    let value = U256::from(10);
-    simple_token.transfer(&address0, &address1, value).await?;
-    let last_block = ethereum_client.get_block_number().await?;
-    // increment by 1 since the read_events is exclusive in the last block.
-    app.update(last_block + 1).await;
-
-    // Now checking the balances after the operations.
-
-    app.assert_balances([
-        (address0.clone(), U256::from(990)),
-        (address1.clone(), U256::from(10)),
-    ])
-    .await;
+    let result = application.run_json_query(query).await?;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, original_counter_value + increment);
 
     node_service.ensure_is_running()?;
 
@@ -477,14 +554,1285 @@ async fn test_wasm_end_to_end_ethereum_tracker(config: impl LineraNetConfig) -> 
     Ok(())
 }
 
+#[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_evm_end_to_end_child_subcontract(config: impl LineraNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client) = config.instantiate().await?;
+
+    let account_owner1 = client.get_owner().unwrap();
+    sol! {
+        function createCounter(uint256 initialValue);
+        function get_address(uint256 index);
+        function get_value();
+        function increment();
+        function remote_increment(uint256 index);
+        function remote_value(uint256 index);
+    }
+
+    let constructor_argument = Vec::new();
+
+    let chain_id = client.load_wallet()?.default_chain().unwrap();
+    let account_chain = Account::chain(chain_id);
+    let account1 = Account {
+        chain_id,
+        owner: account_owner1,
+    };
+    client
+        .transfer_with_accounts(Amount::from_tokens(50), account_chain, account1)
+        .await?;
+
+    let module = load_solidity_example_by_name(
+        "tests/fixtures/evm_child_subcontract.sol",
+        "CounterFactory",
+    )?;
+    let (evm_contract, _dir) = temporary_write_evm_module(module)?;
+
+    let start_value = Amount::from_tokens(27);
+    let instantiation_argument = EvmInstantiation {
+        value: start_value.into(),
+        argument: vec![],
+    };
+    let application_id = client
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            evm_contract.clone(),
+            evm_contract,
+            VmRuntime::Evm,
+            &constructor_argument,
+            &instantiation_argument,
+            &[],
+            None,
+        )
+        .await?;
+
+    let port = get_node_port().await;
+    let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
+
+    let application = node_service.make_application(&chain_id, &application_id)?;
+    let address_app = application_id.evm_address();
+
+    // Creating the subcontracts
+
+    let operation0 = createCounterCall {
+        initialValue: U256::from(42),
+    };
+    let operation0 = get_zero_operation(operation0)?;
+    application.run_json_query(operation0).await?;
+
+    let operation1 = createCounterCall {
+        initialValue: U256::from(149),
+    };
+    let operation1 = get_zero_operation(operation1)?;
+    application.run_json_query(operation1).await?;
+
+    let query0 = get_addressCall {
+        index: U256::from(0),
+    };
+    let query0 = EvmQuery::Query(query0.abi_encode());
+    let address0 = application.run_json_query(query0).await?;
+    let address0 = read_evm_address_entry(address0);
+
+    let query1 = get_addressCall {
+        index: U256::from(1),
+    };
+    let query1 = EvmQuery::Query(query1.abi_encode());
+    let address1 = application.run_json_query(query1).await?;
+    let address1 = read_evm_address_entry(address1);
+    assert_ne!(address0, address1);
+
+    // Creating the applications
+
+    // The balance in Linera and EVM have to match.
+
+    let application0 = ApplicationId::from(address0).with_abi::<EvmAbi>();
+    let application0 = node_service.make_application(&chain_id, &application0)?;
+
+    let application1 = ApplicationId::from(address1).with_abi::<EvmAbi>();
+    let application1 = node_service.make_application(&chain_id, &application1)?;
+
+    let query = get_valueCall {};
+    let query = EvmQuery::Query(query.abi_encode());
+    let result = application0.run_json_query(query.clone()).await?;
+    assert_eq!(read_evm_u256_entry(result), U256::from(42));
+
+    let result = application1.run_json_query(query).await?;
+    assert_eq!(read_evm_u256_entry(result), U256::from(149));
+
+    // Created contracts have balance of 1.
+    let account0 = Account {
+        chain_id,
+        owner: address0.into(),
+    };
+    let account1 = Account {
+        chain_id,
+        owner: address1.into(),
+    };
+    assert_eq!(node_service.balance(&account0).await?, Amount::ONE);
+    assert_eq!(node_service.balance(&account1).await?, Amount::ONE);
+    assert_contract_balance(&application0, address0, Amount::ONE).await?;
+    assert_contract_balance(&application0, address1, Amount::ONE).await?;
+    assert_contract_balance(&application0, address_app, Amount::from_tokens(25)).await?;
+    assert_contract_balance(&application1, address0, Amount::ONE).await?;
+    assert_contract_balance(&application1, address1, Amount::ONE).await?;
+    assert_contract_balance(&application1, address_app, Amount::from_tokens(25)).await?;
+    assert_contract_balance(&application, address0, Amount::ONE).await?;
+    assert_contract_balance(&application, address1, Amount::ONE).await?;
+    assert_contract_balance(&application, address_app, Amount::from_tokens(25)).await?;
+
+    // Operating on the application0
+
+    let operation0 = remote_incrementCall {
+        index: U256::from(0),
+    };
+    let operation0 = get_zero_operation(operation0)?;
+    application.run_json_query(operation0).await?;
+
+    let operation0 = incrementCall {};
+    let operation0 = get_zero_operation(operation0)?;
+    application0.run_json_query(operation0).await?;
+
+    let query = get_valueCall {};
+    let query = EvmQuery::Query(query.abi_encode());
+    let result = application0.run_json_query(query.clone()).await?;
+    assert_eq!(read_evm_u256_entry(result), U256::from(44));
+
+    let query = remote_valueCall {
+        index: U256::from(0),
+    };
+    let query = EvmQuery::Query(query.abi_encode());
+    let result = application.run_json_query(query.clone()).await?;
+    assert_eq!(read_evm_u256_entry(result), U256::from(44));
+
+    node_service.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg(with_revm)]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_evm_end_to_end_balance_and_transfer(config: impl LineraNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client_a) = config.instantiate().await?;
+    let client_b = net.make_client().await;
+    client_b.wallet_init(None).await?;
+    let client_c = net.make_client().await;
+    client_c.wallet_init(None).await?;
+
+    let chain_a = client_a.load_wallet()?.default_chain().unwrap();
+    let chain_b = client_a
+        .open_and_assign(&client_b, Amount::from_tokens(50))
+        .await?;
+    let chain_c = client_a
+        .open_and_assign(&client_c, Amount::from_tokens(50))
+        .await?;
+    let account_chain_a = Account::chain(chain_a);
+
+    let account_owner1 = client_a.get_owner().unwrap();
+    let account_owner2 = client_a.keygen().await?;
+    let address1 = account_owner1.to_evm_address().unwrap();
+    let address2 = account_owner2.to_evm_address().unwrap();
+    let account_a_1 = Account {
+        chain_id: chain_a,
+        owner: account_owner1,
+    };
+    let account_a_2 = Account {
+        chain_id: chain_a,
+        owner: account_owner2,
+    };
+    client_a
+        .transfer_with_accounts(Amount::from_tokens(50), account_chain_a, account_a_1)
+        .await?;
+    client_a
+        .transfer_with_accounts(Amount::from_tokens(50), account_chain_a, account_a_2)
+        .await?;
+
+    sol! {
+        function send_cash(address recipient, uint256 amount);
+        function null_operation();
+    }
+
+    // The balance in Linera and EVM have to match.
+    let constructor_argument = Vec::new();
+
+    let (evm_contract, _dir) =
+        get_evm_contract_path("tests/fixtures/evm_balance_and_transfer.sol")?;
+
+    let start_value = Amount::from_tokens(4);
+    let instantiation_argument = EvmInstantiation {
+        value: start_value.into(),
+        argument: vec![],
+    };
+    let application_id = client_a
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            evm_contract.clone(),
+            evm_contract,
+            VmRuntime::Evm,
+            &constructor_argument,
+            &instantiation_argument,
+            &[],
+            None,
+        )
+        .await?;
+
+    let account_owner_app: AccountOwner = application_id.into();
+    let address_app = account_owner_app.to_evm_address().unwrap();
+    let account_a_app = Account {
+        chain_id: chain_a,
+        owner: account_owner_app,
+    };
+
+    let port_a = get_node_port().await;
+    let port_b = get_node_port().await;
+    let port_c = get_node_port().await;
+    let mut node_service_a = client_a
+        .run_node_service(port_a, ProcessInbox::Skip)
+        .await?;
+    let mut node_service_b = client_b
+        .run_node_service(port_b, ProcessInbox::Skip)
+        .await?;
+    let mut node_service_c = client_c
+        .run_node_service(port_c, ProcessInbox::Skip)
+        .await?;
+
+    let balance_a_1 = node_service_a.balance(&account_a_1).await?;
+    let balance_a_2 = node_service_a.balance(&account_a_2).await?;
+    let balance_a_app = node_service_a.balance(&account_a_app).await?;
+    assert_eq!(balance_a_1, Amount::from_tokens(46));
+    assert_eq!(balance_a_2, Amount::from_tokens(50));
+    assert_eq!(balance_a_app, Amount::from_tokens(4));
+
+    let app_a = node_service_a.make_application(&chain_a, &application_id)?;
+    let app_b = node_service_b.make_application(&chain_b, &application_id)?;
+    let app_c = node_service_c.make_application(&chain_c, &application_id)?;
+
+    // Checking the balances on input
+
+    assert_contract_balance(&app_a, address1, balance_a_1).await?;
+    assert_contract_balance(&app_a, address2, balance_a_2).await?;
+    assert_contract_balance(&app_a, address_app, balance_a_app).await?;
+
+    // Transferring amount
+
+    let amount = Amount::from_tokens(1);
+    let operation = send_cashCall {
+        recipient: address2,
+        amount: amount.into(),
+    };
+    let operation = get_zero_operation(operation)?;
+    app_a.run_json_query(operation).await?;
+
+    // Checking the balances of app_a
+
+    let balance_a_1_after = node_service_a.balance(&account_a_1).await?;
+    let balance_a_2_after = node_service_a.balance(&account_a_2).await?;
+    let balance_a_app_after = node_service_a.balance(&account_a_app).await?;
+    assert_eq!(balance_a_1_after, balance_a_1);
+    assert_eq!(balance_a_2_after, balance_a_2 + amount);
+    assert_eq!(balance_a_app_after, balance_a_app - amount);
+
+    assert_contract_balance(&app_a, address1, balance_a_1_after).await?;
+    assert_contract_balance(&app_a, address2, balance_a_2_after).await?;
+    assert_contract_balance(&app_a, address_app, balance_a_app_after).await?;
+
+    // Doing an operation with a non-zero amount
+    let operation = null_operationCall {};
+    let amount_operation = Amount::from(2);
+    let operation = EvmOperation::new(amount_operation, operation.abi_encode());
+    let operation = EvmQuery::Operation(operation.to_bytes()?);
+    app_a.run_json_query(operation).await?;
+
+    let balance_a_app_after2 = node_service_a.balance(&account_a_app).await?;
+    assert_eq!(balance_a_app_after2, balance_a_app_after + amount_operation);
+
+    // Creating app_b via null_operation and checking balances.
+    let account_b_1 = Account {
+        chain_id: chain_b,
+        owner: account_owner1,
+    };
+    let account_b_2 = Account {
+        chain_id: chain_b,
+        owner: account_owner2,
+    };
+    let account_b_app = Account {
+        chain_id: chain_b,
+        owner: account_owner_app,
+    };
+
+    let operation = null_operationCall {};
+    let operation = get_zero_operation(operation)?;
+    app_b.run_json_query(operation).await?;
+
+    assert_eq!(node_service_b.balance(&account_b_1).await?, Amount::ZERO);
+    assert_eq!(node_service_b.balance(&account_b_2).await?, Amount::ZERO);
+    assert_eq!(node_service_b.balance(&account_b_app).await?, Amount::ZERO);
+    assert_contract_balance(&app_b, address1, Amount::ZERO).await?;
+    assert_contract_balance(&app_b, address2, Amount::ZERO).await?;
+    assert_contract_balance(&app_b, address_app, Amount::ZERO).await?;
+
+    // Creating app_b via service calls and checking balances.
+    assert_contract_balance(&app_c, address1, Amount::ZERO).await?;
+    assert_contract_balance(&app_c, address2, Amount::ZERO).await?;
+    assert_contract_balance(&app_c, address_app, Amount::ZERO).await?;
+
+    // Winding down
+
+    node_service_a.ensure_is_running()?;
+    node_service_b.ensure_is_running()?;
+    node_service_c.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg(with_revm)]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_evm_event(config: impl LineraNetConfig) -> Result<()> {
+    use linera_base::identifiers::{GenericApplicationId, StreamId, StreamName};
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client) = config.instantiate().await?;
+
+    sol! {
+        struct ConstructorArgs {
+            uint64 start_value;
+        }
+        function increment(uint64 input);
+    }
+
+    let start_value = 35;
+    let constructor_argument = ConstructorArgs { start_value };
+    let constructor_argument = constructor_argument.abi_encode();
+
+    let increment = 5;
+
+    let chain = client.load_wallet()?.default_chain().unwrap();
+
+    let (evm_contract, _dir) = get_evm_contract_path("tests/fixtures/evm_example_log.sol")?;
+
+    let instantiation_argument = EvmInstantiation::default();
+    let application_id = client
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            evm_contract.clone(),
+            evm_contract,
+            VmRuntime::Evm,
+            &constructor_argument,
+            &instantiation_argument,
+            &[],
+            None,
+        )
+        .await?;
+
+    let port = get_node_port().await;
+    let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
+
+    let application = node_service.make_application(&chain, &application_id)?;
+
+    let application_id = GenericApplicationId::User(application_id.forget_abi());
+    let stream_name = bcs::to_bytes("ethereum_event")?;
+    let stream_name = StreamName(stream_name);
+
+    let stream_id = StreamId {
+        application_id,
+        stream_name,
+    };
+
+    let mut start_index = 0;
+    let indices_and_events = node_service
+        .events_from_index(&chain, &stream_id, start_index)
+        .await?;
+    let index_and_event = indices_and_events[0].clone();
+    assert_eq!(index_and_event.index, 0);
+    let (origin, block_height, log) =
+        bcs::from_bytes::<(String, u64, Log)>(&index_and_event.event)?;
+    assert_eq!(&origin, "deploy");
+    assert_eq!(block_height, 1);
+    let value = U256::from(start_value);
+    let bytes = Bytes::from(value.to_be_bytes::<32>().to_vec());
+    assert_eq!(log.data.data, bytes);
+    start_index += indices_and_events.len() as u32;
+    assert_eq!(start_index, 1);
+
+    let operation = incrementCall { input: increment };
+    let operation = get_zero_operation(operation)?;
+    application.run_json_query(operation).await?;
+
+    let indices_and_events = node_service
+        .events_from_index(&chain, &stream_id, start_index)
+        .await?;
+    let index_and_event = indices_and_events[0].clone();
+    assert_eq!(index_and_event.index, 1);
+    let (origin, block_height, log) =
+        bcs::from_bytes::<(String, u64, Log)>(&index_and_event.event)?;
+    assert_eq!(&origin, "operation");
+    assert_eq!(block_height, 2);
+    let value1 = U256::from(increment);
+    let value2 = U256::from(start_value + increment);
+    let mut bytes = Vec::new();
+    bytes.extend(value1.to_be_bytes::<32>());
+    bytes.extend(value2.to_be_bytes::<32>());
+    let bytes = Bytes::from(bytes);
+    assert_eq!(log.data.data, bytes);
+    start_index += indices_and_events.len() as u32;
+    assert_eq!(start_index, 2);
+
+    node_service.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg(with_revm)]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_wasm_call_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
+    use call_evm_counter::{CallCounterAbi, CallCounterRequest};
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client) = config.instantiate().await?;
+    let chain = client.load_wallet()?.default_chain().unwrap();
+
+    // Creating the EVM contract
+
+    sol! {
+        struct ConstructorArgs {
+            uint64 initial_value;
+        }
+    }
+
+    let original_counter_value = 35;
+    let constructor_argument = ConstructorArgs {
+        initial_value: original_counter_value,
+    };
+    let constructor_argument = constructor_argument.abi_encode();
+
+    let (evm_contract, _dir) = get_evm_contract_path("tests/fixtures/evm_example_counter.sol")?;
+
+    let instantiation_argument = EvmInstantiation::default();
+    let evm_application_id = client
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            evm_contract.clone(),
+            evm_contract,
+            VmRuntime::Evm,
+            &constructor_argument,
+            &instantiation_argument,
+            &[],
+            None,
+        )
+        .await?;
+
+    // Creating the WASM contract
+
+    let (wasm_contract, wasm_service) = client.build_example("call-evm-counter").await?;
+    type WasmParameter = ApplicationId<EvmAbi>;
+    let wasm_application_id = client
+        .publish_and_create::<CallCounterAbi, WasmParameter, ()>(
+            wasm_contract,
+            wasm_service,
+            VmRuntime::Wasm,
+            &evm_application_id,
+            &(),
+            &[],
+            None,
+        )
+        .await?;
+
+    let port = get_node_port().await;
+    let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
+
+    let wasm_application = node_service.make_application(&chain, &wasm_application_id)?;
+
+    // Testing the queries
+
+    let query = CallCounterRequest::Query;
+    let counter_value = wasm_application.run_json_query(&query).await?;
+    assert_eq!(counter_value, original_counter_value);
+
+    let increment = 5;
+    let query_increment = CallCounterRequest::Increment(increment);
+    wasm_application.run_json_query(&query_increment).await?;
+
+    let counter_value = wasm_application.run_json_query(&query).await?;
+    assert_eq!(counter_value, original_counter_value + increment);
+
+    // Testing the address
+
+    let query = CallCounterRequest::TestCallAddress;
+    let counter_value = wasm_application.run_json_query(&query).await?;
+    assert_eq!(counter_value, 34);
+
+    let query = CallCounterRequest::ContractTestCallAddress;
+    wasm_application.run_json_query(query).await?;
+
+    node_service.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg(with_revm)]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_evm_call_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client) = config.instantiate().await?;
+    let chain = client.load_wallet()?.default_chain().unwrap();
+    let original_counter_value = 35;
+    let increment = 5;
+
+    // Creating the EVM contract
+
+    let (evm_contract, _dir) = get_evm_contract_path("tests/fixtures/evm_example_counter.sol")?;
+
+    let constructor_argument = {
+        sol! {
+            struct ConstructorArgs {
+                uint64 initial_value;
+            }
+        }
+
+        let constructor_argument = ConstructorArgs {
+            initial_value: original_counter_value,
+        };
+        constructor_argument.abi_encode()
+    };
+
+    let instantiation_argument = EvmInstantiation::default();
+    let evm_application_id = client
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            evm_contract.clone(),
+            evm_contract,
+            VmRuntime::Evm,
+            &constructor_argument,
+            &instantiation_argument,
+            &[],
+            None,
+        )
+        .await?;
+
+    // Creating the nesting contract
+
+    sol! {
+        struct ConstructorArgs {
+            address evm_contract;
+        }
+        function nest_increment(uint64 input);
+        function nest_get_value();
+    }
+
+    let evm_contract = evm_application_id.evm_address();
+    let nest_constructor_argument = ConstructorArgs { evm_contract };
+    let nest_constructor_argument = nest_constructor_argument.abi_encode();
+
+    let (nest_contract, _dir) =
+        get_evm_contract_path("tests/fixtures/evm_call_evm_example_counter.sol")?;
+
+    let nest_application_id = client
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            nest_contract.clone(),
+            nest_contract,
+            VmRuntime::Evm,
+            &nest_constructor_argument,
+            &instantiation_argument,
+            &[],
+            None,
+        )
+        .await?;
+
+    let port = get_node_port().await;
+    let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
+
+    let nest_application = node_service.make_application(&chain, &nest_application_id)?;
+
+    let query = nest_get_valueCall {};
+    let query = query.abi_encode();
+    let query = EvmQuery::Query(query);
+    let result = nest_application.run_json_query(query.clone()).await?;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, original_counter_value);
+
+    let operation = nest_incrementCall { input: increment };
+    let operation = get_zero_operation(operation)?;
+    nest_application.run_json_query(operation).await?;
+
+    let result = nest_application.run_json_query(query).await?;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, original_counter_value + increment);
+
+    node_service.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg(with_revm)]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_evm_call_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
+    use counter_no_graphql::CounterNoGraphQlAbi;
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client) = config.instantiate().await?;
+    let chain = client.load_wallet()?.default_chain().unwrap();
+
+    // Creating the WASM smart contract
+    let original_counter_value = 35;
+    let increment = 5;
+    let (contract, service) = client.build_example("counter-no-graphql").await?;
+    let wasm_application_id = client
+        .publish_and_create::<CounterNoGraphQlAbi, (), u64>(
+            contract,
+            service,
+            VmRuntime::Wasm,
+            &(),
+            &original_counter_value,
+            &[],
+            None,
+        )
+        .await?;
+
+    // Creating the EVM smart contract
+
+    sol! {
+        struct ConstructorArgs {
+            bytes32 wasm_contract;
+        }
+        function nest_increment(uint64 input);
+        function nest_get_value();
+    }
+    let query = nest_get_valueCall {};
+    let query = query.abi_encode();
+    let query = EvmQuery::Query(query);
+
+    let wasm_contract = wasm_application_id.bytes32();
+    let nest_constructor_argument = ConstructorArgs { wasm_contract };
+    let nest_constructor_argument = nest_constructor_argument.abi_encode();
+
+    let (nest_contract, _dir) =
+        get_evm_contract_path("tests/fixtures/evm_call_wasm_example_counter.sol")?;
+
+    let instantiation_argument = EvmInstantiation::default();
+    let nest_application_id = client
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            nest_contract.clone(),
+            nest_contract,
+            VmRuntime::Evm,
+            &nest_constructor_argument,
+            &instantiation_argument,
+            &[],
+            None,
+        )
+        .await?;
+
+    let port = get_node_port().await;
+    let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
+
+    let nest_application = node_service.make_application(&chain, &nest_application_id)?;
+
+    let result = nest_application.run_json_query(query.clone()).await?;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, original_counter_value);
+
+    let operation = nest_incrementCall { input: increment };
+    let operation = get_zero_operation(operation)?;
+    nest_application.run_json_query(operation).await?;
+
+    let result = nest_application.run_json_query(query).await?;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, original_counter_value + increment);
+
+    node_service.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg(with_revm)]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_evm_execute_message_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client1) = config.instantiate().await?;
+
+    let client2 = net.make_client().await;
+    client2.wallet_init(None).await?;
+
+    let chain1 = client1.load_wallet()?.default_chain().unwrap();
+    let chain2 = client1.open_and_assign(&client2, Amount::ONE).await?;
+
+    let original_value = 35;
+    let moved_value = 5;
+
+    // Creating the API of the contracts
+
+    sol! {
+        struct ConstructorArgs {
+            uint64 test_value;
+        }
+        function move_value_to_chain(bytes32 chain_id, uint64 moved_value);
+        function get_value();
+    }
+    let query = get_valueCall {};
+    let query = query.abi_encode();
+    let query = EvmQuery::Query(query);
+
+    let constructor_argument = ConstructorArgs { test_value: 42 };
+    let constructor_argument = constructor_argument.abi_encode();
+
+    let instantiation_argument = EvmInstantiation {
+        value: U256::ZERO,
+        argument: u64::abi_encode(&original_value),
+    };
+
+    let (evm_contract, _dir) =
+        get_evm_contract_path("tests/fixtures/evm_example_execute_message.sol")?;
+
+    let application_id = client1
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            evm_contract.clone(),
+            evm_contract,
+            VmRuntime::Evm,
+            &constructor_argument,
+            &instantiation_argument,
+            &[],
+            None,
+        )
+        .await?;
+
+    let port1 = get_node_port().await;
+    let port2 = get_node_port().await;
+    let mut node_service1 = client1.run_node_service(port1, ProcessInbox::Skip).await?;
+    let mut node_service2 = client2.run_node_service(port2, ProcessInbox::Skip).await?;
+    let mut notifications2 = node_service2.notifications(chain2).await?;
+
+    // Creating the applications.
+
+    let application1 = node_service1.make_application(&chain1, &application_id)?;
+
+    let application2 = node_service2.make_application(&chain2, &application_id)?;
+
+    // Now checking the APIs.
+    // First: checking the initial value of the contracts.
+
+    let result = application1.run_json_query(query.clone()).await?;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, original_value);
+
+    let result = application2.run_json_query(query.clone()).await?;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, 0);
+
+    // Second: executing the movement of assets
+
+    let chain_id: [u64; 4] = <[u64; 4]>::from(chain2.0);
+    let chain_id: [u8; 32] = linera_base::crypto::u64_array_to_be_bytes(chain_id);
+    let chain_id: B256 = chain_id.into();
+    let operation = move_value_to_chainCall {
+        chain_id,
+        moved_value,
+    };
+    let operation = get_zero_operation(operation)?;
+    application1.run_json_query(operation).await?;
+
+    notifications2.wait_for_bundle(chain1, None).await?;
+    assert!(!node_service2.process_inbox(&chain2).await?.is_empty());
+
+    // Third: Checking the values after the move
+
+    let result = application1.run_json_query(query.clone()).await?;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, original_value - moved_value);
+
+    let result = application2.run_json_query(query.clone()).await?;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, moved_value);
+
+    node_service1.ensure_is_running()?;
+    node_service2.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg(with_revm)]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_evm_empty_instantiate(config: impl LineraNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client1) = config.instantiate().await?;
+
+    let client2 = net.make_client().await;
+    client2.wallet_init(None).await?;
+
+    let chain1 = client1.load_wallet()?.default_chain().unwrap();
+    let chain2 = client1.open_and_assign(&client2, Amount::ONE).await?;
+
+    sol! {
+        function get_value();
+    }
+    let query = get_valueCall {};
+    let query = query.abi_encode();
+    let query = EvmQuery::Query(query);
+
+    let constructor_argument = Vec::new();
+    let instantiation_argument = EvmInstantiation::default();
+
+    let (evm_contract, _dir) =
+        get_evm_contract_path("tests/fixtures/evm_example_empty_instantiate.sol")?;
+
+    let application_id = client1
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            evm_contract.clone(),
+            evm_contract,
+            VmRuntime::Evm,
+            &constructor_argument,
+            &instantiation_argument,
+            &[],
+            None,
+        )
+        .await?;
+    let port1 = get_node_port().await;
+    let port2 = get_node_port().await;
+    let mut node_service1 = client1.run_node_service(port1, ProcessInbox::Skip).await?;
+    let mut node_service2 = client2.run_node_service(port2, ProcessInbox::Skip).await?;
+
+    // Creating the applications.
+
+    let application1 = node_service1.make_application(&chain1, &application_id)?;
+
+    let application2 = node_service2.make_application(&chain2, &application_id)?;
+
+    // Checking the initial value of the contracts.
+    let result = application1.run_json_query(query.clone()).await?;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, 42);
+    let result = application2.run_json_query(query).await?;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, 37);
+
+    node_service1.ensure_is_running()?;
+    node_service2.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg(with_revm)]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_evm_process_streams_end_to_end_counters(config: impl LineraNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client1) = config.instantiate().await?;
+
+    let client2 = net.make_client().await;
+    client2.wallet_init(None).await?;
+
+    let chain1 = client1.load_wallet()?.default_chain().unwrap();
+    let chain2 = client1.open_and_assign(&client2, Amount::ONE).await?;
+    let chain_id1: [u64; 4] = <[u64; 4]>::from(chain1.0);
+    let chain_id1: [u8; 32] = linera_base::crypto::u64_array_to_be_bytes(chain_id1);
+    let chain_id1: B256 = chain_id1.into();
+
+    let increment = 5;
+
+    // Creating the API of the contracts
+
+    sol! {
+        function increment_value(uint64 increment);
+        function subscribe(bytes32 chain_id, bytes32 application_id);
+        function get_value(bytes32 chain_id);
+    }
+    let query = get_valueCall {
+        chain_id: chain_id1,
+    };
+    let query = query.abi_encode();
+    let query = EvmQuery::Query(query);
+
+    let constructor_argument = Vec::new();
+    let instantiation_argument = EvmInstantiation::default();
+
+    let (evm_contract, _dir) =
+        get_evm_contract_path("tests/fixtures/evm_example_process_streams.sol")?;
+
+    let evm_application_id = client1
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            evm_contract.clone(),
+            evm_contract,
+            VmRuntime::Evm,
+            &constructor_argument,
+            &instantiation_argument,
+            &[],
+            None,
+        )
+        .await?;
+    let application_id: [u64; 4] =
+        <[u64; 4]>::from(evm_application_id.application_description_hash);
+    let application_id: [u8; 32] = linera_base::crypto::u64_array_to_be_bytes(application_id);
+    let application_id: B256 = application_id.into();
+
+    let port1 = get_node_port().await;
+    let port2 = get_node_port().await;
+    let mut node_service1 = client1.run_node_service(port1, ProcessInbox::Skip).await?;
+    let mut node_service2 = client2.run_node_service(port2, ProcessInbox::Skip).await?;
+
+    // Creating the applications.
+
+    let application1 = node_service1.make_application(&chain1, &evm_application_id)?;
+
+    let application2 = node_service2.make_application(&chain2, &evm_application_id)?;
+    let mut notifications2 = node_service2.notifications(chain1).await?;
+
+    let result = application2.run_json_query(query.clone()).await?;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, 0);
+
+    // First: subscribing to the application
+
+    let operation = subscribeCall {
+        chain_id: chain_id1,
+        application_id,
+    };
+    let operation = get_zero_operation(operation)?;
+    application2.run_json_query(operation).await?;
+
+    let result = application2.run_json_query(query.clone()).await?;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, 0);
+
+    // Second: increment the values
+
+    let operation = increment_valueCall { increment };
+    let operation = get_zero_operation(operation)?;
+    application1.run_json_query(operation).await?;
+
+    // Third: process the inbox on chain2
+
+    notifications2.wait_for_events(None).await?;
+    assert!(!node_service2.process_inbox(&chain2).await?.is_empty());
+
+    // Fourth: getting the value
+
+    let result = application2.run_json_query(query.clone()).await?;
+    let counter_value = read_evm_u64_entry(result);
+    assert_eq!(counter_value, increment);
+
+    // Fifth: winding down
+
+    node_service1.ensure_is_running()?;
+    node_service2.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg(with_revm)]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_evm_msg_sender(config: impl LineraNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client) = config.instantiate().await?;
+    let account_owner = client.get_owner().unwrap();
+    let owner = account_owner.to_evm_address().unwrap();
+    let chain = client.load_wallet()?.default_chain().unwrap();
+
+    sol! {
+        function check_msg_sender(address remote_address);
+        function remote_check(address remote_address);
+    }
+
+    let instantiation_argument = EvmInstantiation::default();
+    let constructor_argument = Vec::new();
+
+    // Creating the inner EVM contract
+
+    let (inner_contract, _dir) = get_evm_contract_path("tests/fixtures/evm_msg_sender_inner.sol")?;
+    let application_id_inner = client
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            inner_contract.clone(),
+            inner_contract,
+            VmRuntime::Evm,
+            &constructor_argument,
+            &instantiation_argument,
+            &[],
+            None,
+        )
+        .await?;
+    let evm_contract_inner = application_id_inner.evm_address();
+
+    // Creating the outer EVM contract
+
+    let (outer_contract, _dir) = get_evm_contract_path("tests/fixtures/evm_msg_sender_outer.sol")?;
+    let application_id_outer = client
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            outer_contract.clone(),
+            outer_contract,
+            VmRuntime::Evm,
+            &constructor_argument,
+            &instantiation_argument,
+            &[],
+            None,
+        )
+        .await?;
+
+    // Making the check
+
+    let port = get_node_port().await;
+    let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
+
+    let application_inner = node_service.make_application(&chain, &application_id_inner)?;
+    let application_outer = node_service.make_application(&chain, &application_id_outer)?;
+
+    let operation = check_msg_senderCall {
+        remote_address: owner,
+    };
+    let operation = get_zero_operation(operation)?;
+    application_inner.run_json_query(operation).await?;
+
+    let operation = remote_checkCall {
+        remote_address: evm_contract_inner,
+    };
+    let operation = get_zero_operation(operation)?;
+    application_outer.run_json_query(operation).await?;
+
+    node_service.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg(with_revm)]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_evm_linera_features(config: impl LineraNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    // Initializing a chain and transferring tokens
+    let (mut net, client1) = config.instantiate().await?;
+    let client2 = net.make_client().await;
+    client2.wallet_init(None).await?;
+
+    let chain_id1 = client1.load_wallet()?.default_chain().unwrap();
+    let chain_id2 = client1.open_and_assign(&client2, Amount::ONE).await?;
+    let account_owner2 = client2.get_owner().unwrap();
+    let address2 = account_owner2.to_evm_address().unwrap();
+
+    let account_owner1 = client1.get_owner().unwrap();
+    let account_chain = Account::chain(chain_id1);
+    let account1 = Account {
+        chain_id: chain_id1,
+        owner: account_owner1,
+    };
+    client1
+        .transfer_with_accounts(Amount::from_tokens(50), account_chain, account1)
+        .await?;
+
+    // Creating the EVM smart contract
+    sol! {
+        function test_chain_id();
+        function test_read_data_blob(bytes32 hash, uint32 len);
+        function test_assert_data_blob_exists(bytes32 hash);
+        function test_chain_ownership();
+        function test_authenticated_owner_caller_id();
+        function test_chain_balance(uint256 expected_balance);
+        function test_read_owners();
+        function test_linera_transfer(bytes32 chain_id, address destination, uint256 amount);
+    }
+
+    let (contract, _dir) = get_evm_contract_path("tests/fixtures/evm_test_linera_features.sol")?;
+
+    let constructor_argument = Vec::new();
+    let start_value = Amount::from_tokens(27);
+    let instantiation_argument = EvmInstantiation {
+        value: start_value.into(),
+        argument: vec![],
+    };
+    let application_id = client1
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            contract.clone(),
+            contract,
+            VmRuntime::Evm,
+            &constructor_argument,
+            &instantiation_argument,
+            &[],
+            None,
+        )
+        .await?;
+
+    let port1 = get_node_port().await;
+    let port2 = get_node_port().await;
+    let mut node_service1 = client1.run_node_service(port1, ProcessInbox::Skip).await?;
+    let mut node_service2 = client2.run_node_service(port2, ProcessInbox::Skip).await?;
+    let address_app = application_id.evm_address();
+    let application = node_service1.make_application(&chain_id1, &application_id)?;
+
+    let nft_blob_bytes = b"nft1_data".to_vec();
+    let len = nft_blob_bytes.len() as u32;
+    let hash = node_service1
+        .publish_data_blob(&chain_id1, nft_blob_bytes)
+        .await?;
+    let hash: B256 = <[u8; 32]>::from(hash).into();
+
+    // Testing the ChainId.
+
+    let query = test_chain_idCall {};
+    let query = EvmQuery::Query(query.abi_encode());
+    application.run_json_query(query).await?;
+
+    // Testing Chain Ownership
+
+    let query = test_chain_ownershipCall {};
+    let query = EvmQuery::Query(query.abi_encode());
+    application.run_json_query(query).await?;
+
+    // Testing existence of blob.
+
+    let query = test_assert_data_blob_existsCall { hash };
+    let query = EvmQuery::Query(query.abi_encode());
+    application.run_json_query(query).await?;
+
+    // Reading the blob
+
+    let query = test_read_data_blobCall { hash, len };
+    let query = EvmQuery::Query(query.abi_encode());
+    application.run_json_query(query).await?;
+
+    // Checking authenticated owner/caller_id
+
+    let operation = test_authenticated_owner_caller_idCall {};
+    let operation = get_zero_operation(operation)?;
+    application.run_json_query(operation).await?;
+
+    // Testing the chain balance
+
+    let expected_balance = node_service1.balance(&account_chain).await?;
+    let expected_balance: U256 = expected_balance.into();
+    let query = test_chain_balanceCall { expected_balance };
+    let query = EvmQuery::Query(query.abi_encode());
+    application.run_json_query(query).await?;
+
+    // Testing the owner balances
+
+    let query = test_read_ownersCall {};
+    let query = EvmQuery::Query(query.abi_encode());
+    application.run_json_query(query).await?;
+
+    // Doing a transfer
+
+    assert_contract_balance(&application, address_app, Amount::from_tokens(27)).await?;
+    let b256_chain_id2: B256 = <[u8; 32]>::from(chain_id2.0).into();
+    let amount: U256 = Amount::from_tokens(5).into();
+    let operation = test_linera_transferCall {
+        chain_id: b256_chain_id2,
+        destination: address2,
+        amount,
+    };
+    let operation = get_zero_operation(operation)?;
+    application.run_json_query(operation).await?;
+    assert_contract_balance(&application, address_app, Amount::from_tokens(22)).await?;
+    assert!(!node_service2.process_inbox(&chain_id2).await?.is_empty());
+    let account2 = Account {
+        chain_id: chain_id2,
+        owner: account_owner2,
+    };
+    assert_eq!(
+        node_service2.balance(&account2).await?,
+        Amount::from_tokens(5)
+    );
+
+    // Winding down
+
+    node_service1.ensure_is_running()?;
+    node_service2.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(all(feature = "rocksdb", feature = "scylladb"), test_case(LocalNetConfig::new_test(Database::DualRocksDbScyllaDb, Network::Grpc) ; "dualrocksdbscylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
     use counter::CounterAbi;
+
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
 
@@ -494,12 +1842,14 @@ async fn test_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()
     let increment = 5;
 
     let chain = client.load_wallet()?.default_chain().unwrap();
+    let account_chain = Account::chain(chain);
     let (contract, service) = client.build_example("counter").await?;
 
     let application_id = client
         .publish_and_create::<CounterAbi, (), u64>(
             contract,
             service,
+            VmRuntime::Wasm,
             &(),
             &original_counter_value,
             &[],
@@ -509,15 +1859,19 @@ async fn test_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()
     let port = get_node_port().await;
     let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
 
-    let application = node_service
-        .make_application(&chain, &application_id)
-        .await?;
+    let application = node_service.make_application(&chain, &application_id)?;
+
+    let balance1 = node_service.balance(&account_chain).await?;
 
     let counter_value: u64 = application.query_json("value").await?;
     assert_eq!(counter_value, original_counter_value);
+    let balance2 = node_service.balance(&account_chain).await?;
+    assert_eq!(balance1, balance2);
 
     let mutation = format!("increment(value: {increment})");
     application.mutate(mutation).await?;
+    let balance3 = node_service.balance(&account_chain).await?;
+    assert!(balance3 < balance2);
 
     let counter_value: u64 = application.query_json("value").await?;
     assert_eq!(counter_value, original_counter_value + increment);
@@ -530,11 +1884,209 @@ async fn test_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()
     Ok(())
 }
 
+#[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_evm_erc20_shared(config: impl LineraNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    let num_operations = 500;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client1) = config.instantiate().await?;
+    let client2 = net.make_client().await;
+    client2.wallet_init(None).await?;
+
+    let chain1 = client1.load_wallet()?.default_chain().unwrap();
+    let chain2 = client1.open_and_assign(&client2, Amount::ONE).await?;
+    let owner1 = client1.get_owner().unwrap();
+    let owner2 = client1.keygen().await?;
+    let address1 = owner1.to_evm_address().unwrap();
+    let address2 = owner2.to_evm_address().unwrap();
+
+    sol! {
+        struct ConstructorArgs {
+            uint256 the_supply;
+        }
+        function totalSupply();
+        function transfer(address to, uint256 value);
+        function balanceOf(address account);
+        function transferToChain(bytes32 chain_id, address destination, uint256 value);
+    }
+
+    let the_supply = U256::from(1000000000);
+    let transfer1 = U256::from(1);
+    let transfer2 = U256::from(6);
+    let constructor_argument = ConstructorArgs { the_supply };
+    let constructor_argument = constructor_argument.abi_encode();
+
+    let instantiation_argument = EvmInstantiation {
+        value: U256::ZERO,
+        argument: U256::abi_encode(&the_supply),
+    };
+
+    let (evm_contract, _dir) = get_evm_contract_path("tests/fixtures/erc20_shared.sol")?;
+
+    let application_id = client1
+        .publish_and_create::<EvmAbi, Vec<u8>, EvmInstantiation>(
+            evm_contract.clone(),
+            evm_contract,
+            VmRuntime::Evm,
+            &constructor_argument,
+            &instantiation_argument,
+            &[],
+            None,
+        )
+        .await?;
+
+    let port1 = get_node_port().await;
+    let port2 = get_node_port().await;
+    let mut node_service1 = client1.run_node_service(port1, ProcessInbox::Skip).await?;
+    let mut node_service2 = client2.run_node_service(port2, ProcessInbox::Skip).await?;
+
+    let application1 = node_service1.make_application(&chain1, &application_id)?;
+
+    let application2 = node_service2.make_application(&chain2, &application_id)?;
+    let mut notifications2 = node_service2.notifications(chain2).await?;
+
+    // Checking the total supply
+
+    let total_supply = totalSupplyCall {};
+    let query = total_supply.abi_encode();
+    let query = EvmQuery::Query(query);
+    let result = application1.run_json_query(query).await?;
+    assert_eq!(read_evm_u256_entry(result), the_supply);
+
+    // Transferring to another user and checking the balances.
+
+    let operation = transferCall {
+        to: address2,
+        value: transfer1,
+    };
+    let query = get_zero_operations(operation, num_operations)?;
+    let time_start = Instant::now();
+    application1.run_json_query(query).await?;
+    let average_time = (time_start.elapsed().as_millis() as f64) / (num_operations as f64);
+    tracing::info!("Average runtime for transfer={average_time}");
+
+    let query = balanceOfCall { account: address1 };
+    let query = EvmQuery::Query(query.abi_encode());
+    let result = application1.run_json_query(query).await?;
+    let mut repeated_transfer1 = U256::ZERO;
+    for _ in 0..num_operations {
+        repeated_transfer1 += transfer1;
+    }
+    assert_eq!(read_evm_u256_entry(result), the_supply - repeated_transfer1);
+
+    let query = balanceOfCall { account: address2 };
+    let query = EvmQuery::Query(query.abi_encode());
+    let result = application1.run_json_query(query).await?;
+    assert_eq!(read_evm_u256_entry(result), repeated_transfer1);
+
+    // Transferring to another chain and checking the balances.
+
+    let chain_id: [u64; 4] = <[u64; 4]>::from(chain2.0);
+    let chain_id: [u8; 32] = linera_base::crypto::u64_array_to_be_bytes(chain_id);
+    let chain_id: B256 = chain_id.into();
+    let operation = transferToChainCall {
+        chain_id,
+        destination: address2,
+        value: transfer2,
+    };
+    let operation = get_zero_operation(operation)?;
+    application1.run_json_query(operation).await?;
+
+    notifications2.wait_for_bundle(chain1, None).await?;
+    assert!(!node_service2.process_inbox(&chain2).await?.is_empty());
+
+    // Checking the balances on both chains.
+
+    let query = balanceOfCall { account: address1 };
+    let query = EvmQuery::Query(query.abi_encode());
+    let result = application1.run_json_query(query.clone()).await?;
+    assert_eq!(
+        read_evm_u256_entry(result),
+        the_supply - repeated_transfer1 - transfer2
+    );
+
+    let query = balanceOfCall { account: address2 };
+    let query = EvmQuery::Query(query.abi_encode());
+    let result = application2.run_json_query(query).await?;
+    assert_eq!(read_evm_u256_entry(result), transfer2);
+
+    // Winding down
+
+    node_service1.ensure_is_running()?;
+    node_service2.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+    Ok(())
+}
+
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_wasm_end_to_end_counter_no_graphql(config: impl LineraNetConfig) -> Result<()> {
+    use counter_no_graphql::{CounterNoGraphQlAbi, CounterRequest};
+
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client) = config.instantiate().await?;
+
+    let original_counter_value = 35;
+    let increment = 5;
+
+    let chain = client.load_wallet()?.default_chain().unwrap();
+    let (contract, service) = client.build_example("counter-no-graphql").await?;
+
+    let application_id = client
+        .publish_and_create::<CounterNoGraphQlAbi, (), u64>(
+            contract,
+            service,
+            VmRuntime::Wasm,
+            &(),
+            &original_counter_value,
+            &[],
+            None,
+        )
+        .await?;
+    let port = get_node_port().await;
+    let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
+
+    let application = node_service.make_application(&chain, &application_id)?;
+
+    let query = CounterRequest::Query;
+    let read_counter_value = application.run_json_query(&query).await?;
+    let mut counter_value = original_counter_value;
+    assert_eq!(read_counter_value, counter_value);
+
+    // executing a query that mutates the state
+
+    let query_increment = CounterRequest::Increment(increment);
+    application.run_json_query(&query_increment).await?;
+
+    let read_counter_value = application.run_json_query(&query).await?;
+    counter_value += increment;
+    assert_eq!(read_counter_value, counter_value);
+
+    node_service.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_counter_publish_create(config: impl LineraNetConfig) -> Result<()> {
     use counter::CounterAbi;
@@ -550,18 +2102,22 @@ async fn test_wasm_end_to_end_counter_publish_create(config: impl LineraNetConfi
     let chain = client.load_wallet()?.default_chain().unwrap();
     let (contract, service) = client.build_example("counter").await?;
 
-    let bytecode_id = client
-        .publish_bytecode::<CounterAbi, (), u64>(contract, service, None)
+    let module_id = client
+        .publish_module::<CounterAbi, (), u64>(contract, service, VmRuntime::Wasm, None)
         .await?;
     let application_id = client
-        .create_application(&bytecode_id, &(), &original_counter_value, &[], None)
+        .create_application(&module_id, &(), &original_counter_value, &[], None)
         .await?;
     let port = get_node_port().await;
     let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
+    let query = format!("query {{ applications(chainId:\"{chain}\") {{ id }} }}");
+    let response = node_service.query_node(query).await?;
+    assert_eq!(
+        response["applications"][0]["id"].as_str().unwrap(),
+        &application_id.forget_abi().to_string()
+    );
 
-    let application = node_service
-        .make_application(&chain, &application_id)
-        .await?;
+    let application = node_service.make_application(&chain, &application_id)?;
 
     let counter_value: u64 = application.query_json("value").await?;
     assert_eq!(counter_value, original_counter_value);
@@ -583,28 +2139,31 @@ async fn test_wasm_end_to_end_counter_publish_create(config: impl LineraNetConfi
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
-async fn test_wasm_end_to_end_social_user_pub_sub(config: impl LineraNetConfig) -> Result<()> {
-    use linera_base::time::Instant;
+async fn test_wasm_end_to_end_social_event_streams(config: impl LineraNetConfig) -> Result<()> {
     use social::SocialAbi;
+
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
 
     let (mut net, client1) = config.instantiate().await?;
 
     let client2 = net.make_client().await;
-    client2.wallet_init(&[], FaucetOption::None).await?;
+    client2.wallet_init(None).await?;
 
-    let chain1 = client1.load_wallet()?.default_chain().unwrap();
+    // We use a newly opened chain for the publisher, so that client2 will not be listening to that
+    // chain by default.
+    let chain1 = client1
+        .open_and_assign(&client1, Amount::from_tokens(100))
+        .await?;
     let chain2 = client1.open_and_assign(&client2, Amount::ONE).await?;
     let (contract, service) = client1.build_example("social").await?;
-    let bytecode_id = client1
-        .publish_bytecode::<SocialAbi, (), ()>(contract, service, None)
+    let module_id = client1
+        .publish_module::<SocialAbi, (), ()>(contract, service, VmRuntime::Wasm, None)
         .await?;
     let application_id = client1
-        .create_application(&bytecode_id, &(), &(), &[], None)
+        .create_application(&module_id, &(), &(), &[], None)
         .await?;
 
     let port1 = get_node_port().await;
@@ -616,37 +2175,14 @@ async fn test_wasm_end_to_end_social_user_pub_sub(config: impl LineraNetConfig) 
         .run_node_service(port2, ProcessInbox::Automatic)
         .await?;
 
-    // Request the application so chain 2 has it, too.
-    node_service2
-        .request_application(&chain2, &application_id)
+    let app2 = node_service2.make_application(&chain2, &application_id)?;
+    app2.mutate(format!("subscribe(chainId: \"{chain1}\")"))
         .await?;
+    let (_, height2) = node_service2.chain_tip(chain2).await?.unwrap();
 
-    // First chain1 receives the request for application and then
-    // chain2 receives the requested application
-    node_service1.process_inbox(&chain1).await?;
-    node_service2.process_inbox(&chain2).await?;
+    let mut notifications = node_service2.notifications(chain2).await?;
 
-    let app2 = node_service2
-        .make_application(&chain2, &application_id)
-        .await?;
-    let hash = app2
-        .mutate(format!("subscribe(chainId: \"{chain1}\")"))
-        .await?;
-
-    node_service1.process_inbox(&chain1).await?;
-
-    // The returned hash should now be the latest one.
-    let query = format!("query {{ chain(chainId: \"{chain2}\") {{ tipState {{ blockHash }} }} }}");
-    for node_service in [&node_service2, &node_service1] {
-        let response = node_service.query_node(&query).await?;
-        assert_eq!(hash, response["chain"]["tipState"]["blockHash"]);
-    }
-
-    let mut notifications = Box::pin(node_service2.notifications(chain2).await?);
-
-    let app1 = node_service1
-        .make_application(&chain1, &application_id)
-        .await?;
+    let app1 = node_service1.make_application(&chain1, &application_id)?;
     app1.mutate("post(text: \"Linera Social is the new Mastodon!\")")
         .await?;
 
@@ -658,19 +2194,41 @@ async fn test_wasm_end_to_end_social_user_pub_sub(config: impl LineraNetConfig) 
             ]
         }
     });
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let result =
-            linera_base::time::timer::timeout(deadline - Instant::now(), notifications.next())
-                .await?;
-        anyhow::ensure!(result.transpose()?.is_some(), "Failed to confirm post");
-        let response = app2.query(query).await?;
-        if response == expected_response {
-            tracing::info!("Confirmed post");
-            break;
+    notifications.wait_for_block(height2.try_add_one()?).await?;
+    assert_eq!(app2.query(query).await?, expected_response);
+
+    let tip_after_first_post = node_service2.chain_tip(chain1).await?;
+
+    // Perform an operation that does not emit events, or messages that client 2 listens to - to be
+    // safe, we just transfer from chain1 to itself.
+    node_service1
+        .transfer(
+            chain1,
+            AccountOwner::CHAIN,
+            Account::chain(chain1),
+            Amount::ONE,
+        )
+        .await?;
+
+    let (_, height2) = node_service2.chain_tip(chain2).await?.unwrap();
+    app1.mutate("post(text: \"Second post!\")").await?;
+
+    let query = "receivedPosts { keys { author, index } }";
+    let expected_response = json!({
+        "receivedPosts": {
+            "keys": [
+                { "author": chain1, "index": 1 },
+                { "author": chain1, "index": 0 }
+            ]
         }
-        tracing::warn!("Waiting to confirm post: {}", response);
-    }
+    });
+    notifications.wait_for_block(height2.try_add_one()?).await?;
+    assert_eq!(app2.query(query).await?, expected_response);
+
+    let tip_after_second_post = node_service2.chain_tip(chain1).await?;
+    // The second post should not have moved the tip hash - client 2 should have only preprocessed
+    // that block, without downloading the transfer block in between.
+    assert_eq!(tip_after_first_post, tip_after_second_post);
 
     node_service1.ensure_is_running()?;
     node_service2.ensure_is_running()?;
@@ -681,6 +2239,197 @@ async fn test_wasm_end_to_end_social_user_pub_sub(config: impl LineraNetConfig) 
     Ok(())
 }
 
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_wasm_end_to_end_allowances_fungible(config: impl LineraNetConfig) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    use fungible::{FungibleTokenAbi, InitialState, Parameters};
+
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    // Create runner and three clients.
+    let (mut net, client1) = config.instantiate().await?;
+
+    let client2 = net.make_client().await;
+    client2.wallet_init(None).await?;
+
+    let client3 = net.make_client().await;
+    client3.wallet_init(None).await?;
+
+    let chain1 = *client1.load_wallet()?.owned_chain_ids().first().unwrap();
+
+    // Generate keys for all clients.
+    let owner1 = client1.keygen().await?;
+    let owner2 = client2.keygen().await?;
+    let owner3 = client3.keygen().await?;
+
+    // Open a chain owned by both clients.
+    let chain2 = client1
+        .open_multi_owner_chain(
+            chain1,
+            vec![owner1, owner2, owner3],
+            vec![100, 100, 100],
+            u32::MAX,
+            Amount::from_tokens(6),
+            10_000,
+        )
+        .await?;
+
+    // Assign chain2 to clients.
+    client1.assign(owner1, chain2).await?;
+    client2.assign(owner2, chain2).await?;
+    client3.assign(owner3, chain2).await?;
+
+    // The initial accounts on chain1
+    let accounts = BTreeMap::from([
+        (owner1, Amount::from_tokens(9)),
+        (owner2, Amount::from_tokens(19)),
+    ]);
+    let state = InitialState { accounts };
+    // Setting up the application and verifying
+    let (contract, service) = client1.build_example("fungible").await?;
+    let params = Parameters::new("DEL");
+    let application_id = client1
+        .publish_and_create::<FungibleTokenAbi, Parameters, InitialState>(
+            contract,
+            service,
+            VmRuntime::Wasm,
+            &params,
+            &state,
+            &[],
+            Some(chain2),
+        )
+        .await?;
+
+    let port1 = get_node_port().await;
+    let port2 = get_node_port().await;
+    let port3 = get_node_port().await;
+    let mut node_service1 = client1.run_node_service(port1, ProcessInbox::Skip).await?;
+    let mut node_service2 = client2.run_node_service(port2, ProcessInbox::Skip).await?;
+    let mut node_service3 = client3.run_node_service(port3, ProcessInbox::Skip).await?;
+
+    let app1 = FungibleApp(node_service1.make_application(&chain2, &application_id)?);
+    let app2 = FungibleApp(node_service2.make_application(&chain2, &application_id)?);
+    let app3 = FungibleApp(node_service3.make_application(&chain2, &application_id)?);
+
+    let mut notifications2 = node_service2.notifications(chain2).await?;
+    let mut notifications3 = node_service3.notifications(chain2).await?;
+    // Wait until clients 2 and 3 see the initialized application state.
+    let (_, height) = node_service1.chain_tip(chain2).await?.unwrap();
+    if node_service2
+        .chain_tip(chain2)
+        .await?
+        .is_none_or(|(_, h)| h < height)
+    {
+        notifications2.wait_for_block(height).await?;
+    }
+    if node_service3
+        .chain_tip(chain2)
+        .await?
+        .is_none_or(|(_, h)| h < height)
+    {
+        notifications3.wait_for_block(height).await?;
+    }
+
+    let expected_balances = [
+        (owner1, Amount::from_tokens(9)),
+        (owner2, Amount::from_tokens(19)),
+    ];
+    app1.assert_balances(expected_balances).await;
+    app2.assert_balances(expected_balances).await;
+    app3.assert_balances(expected_balances).await;
+
+    // Approving a transfer.
+    app1.approve(&owner1, &owner2, Amount::from_tokens(93))
+        .await;
+
+    app1.assert_allowance(&owner1, &owner2, Amount::from_tokens(93))
+        .await;
+
+    let (_, height) = node_service1.chain_tip(chain2).await?.unwrap();
+    notifications2.wait_for_block(height).await?;
+    assert_eq!(
+        app2.get_allowance(&owner1, &owner2).await,
+        Amount::from_tokens(93)
+    );
+
+    // Doing the transfer from owner 1.
+    app2.transfer_from(
+        &owner1,
+        &owner2,
+        Amount::from_tokens(2),
+        Account {
+            chain_id: chain2,
+            owner: owner3,
+        },
+    )
+    .await;
+
+    // Checking the final values on chain1 and chain2.
+
+    let expected_balances = [
+        (owner1, Amount::from_tokens(7)),
+        (owner2, Amount::from_tokens(19)),
+        (owner3, Amount::from_tokens(2)),
+    ];
+    app2.assert_balances(expected_balances).await;
+    app2.assert_allowance(&owner1, &owner2, Amount::from_tokens(91))
+        .await;
+
+    // Winding down the system
+
+    node_service1.ensure_is_running()?;
+    node_service2.ensure_is_running()?;
+    node_service3.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+async fn publish_and_create_native_fungible(
+    client: &ClientWrapper,
+    name: &str,
+    params: &fungible::Parameters,
+    state: &fungible::InitialState,
+    chain_id: Option<ChainId>,
+) -> Result<ApplicationId<FungibleTokenAbi>> {
+    let (contract, service) = client.build_example(name).await?;
+    use fungible::{InitialState, Parameters};
+    if name == "native-fungible" {
+        client
+            .publish_and_create::<FungibleTokenAbi, Parameters, InitialState>(
+                contract,
+                service,
+                VmRuntime::Wasm,
+                params,
+                state,
+                &[],
+                chain_id,
+            )
+            .await
+    } else {
+        let application_id = client
+            .publish_and_create::<FungibleTokenAbi, Parameters, InitialState>(
+                contract,
+                service,
+                VmRuntime::Wasm,
+                params,
+                state,
+                &[],
+                chain_id,
+            )
+            .await?;
+        Ok(application_id.forget_abi().with_abi())
+    }
+}
+
 // TODO(#2051): Enable the test `test_wasm_end_to_end_fungible::scylladb_grpc` that is frequently failing.
 // The failure is `Error: Could not find application URI: .... after 15 tries`.
 //#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc), "fungible" ; "scylladb_grpc"))]
@@ -689,10 +2438,8 @@ async fn test_wasm_end_to_end_social_user_pub_sub(config: impl LineraNetConfig) 
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc), "native-fungible" ; "native_scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc), "fungible" ; "aws_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc), "native-fungible" ; "native_aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build), "fungible" ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build), "native-fungible" ; "native_kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None), "fungible" ; "remote_net_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None), "native-fungible" ; "native_remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains), "fungible" ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains), "native-fungible" ; "native_remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_fungible(
     config: impl LineraNetConfig,
@@ -700,7 +2447,7 @@ async fn test_wasm_end_to_end_fungible(
 ) -> Result<()> {
     use std::collections::BTreeMap;
 
-    use fungible::{FungibleTokenAbi, InitialState, Parameters};
+    use fungible::{InitialState, Parameters};
 
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
@@ -708,14 +2455,14 @@ async fn test_wasm_end_to_end_fungible(
     let (mut net, client1) = config.instantiate().await?;
 
     let client2 = net.make_client().await;
-    client2.wallet_init(&[], FaucetOption::None).await?;
+    client2.wallet_init(None).await?;
 
     let chain1 = client1.load_wallet()?.default_chain().unwrap();
     let chain2 = client1.open_and_assign(&client2, Amount::ONE).await?;
 
     // The players
-    let account_owner1 = get_fungible_account_owner(&client1);
-    let account_owner2 = get_fungible_account_owner(&client2);
+    let account_owner1 = get_account_owner(&client1);
+    let account_owner2 = get_account_owner(&client2);
     // The initial accounts on chain1
     let accounts = BTreeMap::from([
         (account_owner1, Amount::from_tokens(5)),
@@ -723,37 +2470,23 @@ async fn test_wasm_end_to_end_fungible(
     ]);
     let state = InitialState { accounts };
     // Setting up the application and verifying
-    let (contract, service) = client1.build_example(example_name).await?;
     let params = if example_name == "native-fungible" {
         // Native Fungible has a fixed NAT ticker symbol, anything else will be rejected
         Parameters::new("NAT")
     } else {
         Parameters::new("FUN")
     };
-    let application_id = client1
-        .publish_and_create::<FungibleTokenAbi, Parameters, InitialState>(
-            contract,
-            service,
-            &params,
-            &state,
-            &[],
-            None,
-        )
-        .await?;
+    let application_id =
+        publish_and_create_native_fungible(&client1, example_name, &params, &state, None).await?;
 
     let port1 = get_node_port().await;
     let port2 = get_node_port().await;
     let mut node_service1 = client1.run_node_service(port1, ProcessInbox::Skip).await?;
     let mut node_service2 = client2.run_node_service(port2, ProcessInbox::Skip).await?;
+    let mut notifications1 = node_service1.notifications(chain1).await?;
+    let mut notifications2 = node_service2.notifications(chain2).await?;
 
-    let app1 = FungibleApp(
-        node_service1
-            .make_application(&chain1, &application_id)
-            .await?,
-    );
-
-    // Needed synchronization though removing it does not get error in 100% of cases.
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
+    let app1 = NativeFungibleApp(node_service1.make_application(&chain1, &application_id)?);
 
     let expected_balances = [
         (account_owner1, Amount::from_tokens(5)),
@@ -767,7 +2500,7 @@ async fn test_wasm_end_to_end_fungible(
     app1.transfer(
         &account_owner1,
         Amount::ONE,
-        fungible::Account {
+        Account {
             chain_id: chain2,
             owner: account_owner2,
         },
@@ -783,14 +2516,11 @@ async fn test_wasm_end_to_end_fungible(
     app1.assert_entries(expected_balances).await;
     app1.assert_keys([account_owner1, account_owner2]).await;
 
+    notifications2.wait_for_bundle(chain1, None).await?;
     assert_eq!(node_service2.process_inbox(&chain2).await?.len(), 1);
 
     // Fungible didn't exist on chain2 initially but now it does and we can talk to it.
-    let app2 = FungibleApp(
-        node_service2
-            .make_application(&chain2, &application_id)
-            .await?,
-    );
+    let app2 = NativeFungibleApp(node_service2.make_application(&chain2, &application_id)?);
 
     let expected_balances = [
         (account_owner1, Amount::ZERO),
@@ -803,11 +2533,11 @@ async fn test_wasm_end_to_end_fungible(
 
     // Claiming more money from chain1 to chain2.
     app2.claim(
-        fungible::Account {
+        Account {
             chain_id: chain1,
             owner: account_owner2,
         },
-        fungible::Account {
+        Account {
             chain_id: chain2,
             owner: account_owner2,
         },
@@ -815,8 +2545,10 @@ async fn test_wasm_end_to_end_fungible(
     )
     .await;
 
-    // Make sure that the cross-chain communication happens fast enough.
+    // Let chain 1 process the claim and then chain 2 process the credit.
+    notifications1.wait_for_bundle(chain2, None).await?;
     assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
+    notifications2.wait_for_bundle(chain1, None).await?;
     assert_eq!(node_service2.process_inbox(&chain2).await?.len(), 1);
 
     // Checking the final value
@@ -853,10 +2585,8 @@ async fn test_wasm_end_to_end_fungible(
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc), "native-fungible" ; "native_scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc), "fungible" ; "aws_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc), "native-fungible" ; "native_aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build), "fungible" ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build), "native-fungible" ; "native_kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None), "fungible" ; "remote_net_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None), "native-fungible" ; "native_remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains), "fungible" ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains), "native-fungible" ; "native_remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_same_wallet_fungible(
     config: impl LineraNetConfig,
@@ -864,7 +2594,7 @@ async fn test_wasm_end_to_end_same_wallet_fungible(
 ) -> Result<()> {
     use std::collections::BTreeMap;
 
-    use fungible::{Account, FungibleTokenAbi, InitialState, Parameters};
+    use fungible::{InitialState, Parameters};
 
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
@@ -875,19 +2605,15 @@ async fn test_wasm_end_to_end_same_wallet_fungible(
     // Get a chain different than the default
     let chain2 = client1
         .load_wallet()?
-        .chain_ids()
+        .owned_chain_ids()
         .into_iter()
         .find(|chain_id| chain_id != &chain1)
         .expect("Failed to obtain a chain ID from the wallet");
 
     // The players
-    let account_owner1 = get_fungible_account_owner(&client1);
-    let account_owner2 = {
-        let wallet = client1.load_wallet()?;
-        let user_chain = wallet.get(chain2).unwrap();
-        let public_key = user_chain.key_pair.as_ref().unwrap().public();
-        AccountOwner::User(public_key.into())
-    };
+    let account_owner1 = get_account_owner(&client1);
+    let account_owner2 = client1.keygen().await?;
+
     // The initial accounts on chain1
     let accounts = BTreeMap::from([
         (account_owner1, Amount::from_tokens(5)),
@@ -895,73 +2621,53 @@ async fn test_wasm_end_to_end_same_wallet_fungible(
     ]);
     let state = InitialState { accounts };
     // Setting up the application and verifying
-    let (contract, service) = client1.build_example(example_name).await?;
     let params = if example_name == "native-fungible" {
         // Native Fungible has a fixed NAT ticker symbol, anything else will be rejected
         Parameters::new("NAT")
     } else {
         Parameters::new("FUN")
     };
-    let application_id = client1
-        .publish_and_create::<FungibleTokenAbi, Parameters, InitialState>(
-            contract,
-            service,
-            &params,
-            &state,
-            &[],
-            None,
-        )
-        .await?;
+    let application_id =
+        publish_and_create_native_fungible(&client1, example_name, &params, &state, None).await?;
 
     let port = get_node_port().await;
     let mut node_service = client1.run_node_service(port, ProcessInbox::Skip).await?;
+    let mut notifications2 = node_service.notifications(chain2).await?;
 
-    let app1 = FungibleApp(
-        node_service
-            .make_application(&chain1, &application_id)
-            .await?,
-    );
+    let app1 = NativeFungibleApp(node_service.make_application(&chain1, &application_id)?);
 
-    // Needed synchronization though removing it does not get error in 100% of cases.
-    assert_eq!(node_service.process_inbox(&chain1).await?.len(), 1);
+    let expected_balances: Vec<(AccountOwner, Amount)> = state.accounts.into_iter().collect();
 
-    let expected_balances = [
-        (account_owner1, Amount::from_tokens(5)),
-        (account_owner2, Amount::from_tokens(2)),
-    ];
-    app1.assert_balances(expected_balances).await;
+    app1.assert_balances(expected_balances.clone()).await;
     app1.assert_entries(expected_balances).await;
     app1.assert_keys([account_owner1, account_owner2]).await;
-
-    // Transferring
-    app1.transfer(
+    // Making multiple transfers in a single block.
+    app1.repeated_transfer(
         &account_owner1,
         Amount::ONE,
         Account {
             chain_id: chain2,
             owner: account_owner2,
         },
+        4,
     )
     .await;
 
+    notifications2.wait_for_bundle(chain1, None).await?;
     assert_eq!(node_service.process_inbox(&chain2).await?.len(), 1);
 
     // Checking the final values on chain1 and chain2.
     let expected_balances = [
-        (account_owner1, Amount::from_tokens(4)),
+        (account_owner1, Amount::from_tokens(1)),
         (account_owner2, Amount::from_tokens(2)),
     ];
     app1.assert_balances(expected_balances).await;
     app1.assert_entries(expected_balances).await;
     app1.assert_keys([account_owner1, account_owner2]).await;
 
-    let app2 = FungibleApp(
-        node_service
-            .make_application(&chain2, &application_id)
-            .await?,
-    );
+    let app2 = NativeFungibleApp(node_service.make_application(&chain2, &application_id)?);
 
-    let expected_balances = [(account_owner2, Amount::ONE)];
+    let expected_balances = [(account_owner2, Amount::from_tokens(4))];
     app2.assert_balances(expected_balances).await;
     app2.assert_entries(expected_balances).await;
     app2.assert_keys([account_owner2]).await;
@@ -977,42 +2683,48 @@ async fn test_wasm_end_to_end_same_wallet_fungible(
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Result<()> {
     use non_fungible::{NftOutput, NonFungibleTokenAbi};
+
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
 
     let (mut net, client1) = config.instantiate().await?;
 
     let client2 = net.make_client().await;
-    client2.wallet_init(&[], FaucetOption::None).await?;
+    client2.wallet_init(None).await?;
 
     let chain1 = client1.load_wallet()?.default_chain().unwrap();
     let chain2 = client1.open_and_assign(&client2, Amount::ONE).await?;
 
     // The players
-    let account_owner1 = get_fungible_account_owner(&client1);
-    let account_owner2 = get_fungible_account_owner(&client2);
+    let account_owner1 = get_account_owner(&client1);
+    let account_owner2 = get_account_owner(&client2);
 
     // Setting up the application and verifying
     let (contract, service) = client1.build_example("non-fungible").await?;
     let application_id = client1
-        .publish_and_create::<NonFungibleTokenAbi, (), ()>(contract, service, &(), &(), &[], None)
+        .publish_and_create::<NonFungibleTokenAbi, (), ()>(
+            contract,
+            service,
+            VmRuntime::Wasm,
+            &(),
+            &(),
+            &[],
+            None,
+        )
         .await?;
 
     let port1 = get_node_port().await;
     let port2 = get_node_port().await;
     let mut node_service1 = client1.run_node_service(port1, ProcessInbox::Skip).await?;
     let mut node_service2 = client2.run_node_service(port2, ProcessInbox::Skip).await?;
+    let mut notifications1 = node_service1.notifications(chain1).await?;
+    let mut notifications2 = node_service2.notifications(chain2).await?;
 
-    let app1 = NonFungibleApp(
-        node_service1
-            .make_application(&chain1, &application_id)
-            .await?,
-    );
+    let app1 = NonFungibleApp(node_service1.make_application(&chain1, &application_id)?);
 
     let nft1_name = "nft1".to_string();
     let nft1_minter = account_owner1;
@@ -1056,13 +2768,14 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
     app1.transfer(
         &account_owner1,
         &nft1_id,
-        &fungible::Account {
+        &Account {
             chain_id: chain2,
             owner: account_owner1,
         },
     )
     .await;
 
+    notifications2.wait_for_bundle(chain1, None).await?;
     assert_eq!(node_service2.process_inbox(&chain2).await?.len(), 1);
 
     // Checking the NFT is removed from chain1
@@ -1073,11 +2786,7 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
         .contains(&nft1_id));
 
     // Non Fungible didn't exist on chain2 initially but now it does and we can talk to it.
-    let app2 = NonFungibleApp(
-        node_service2
-            .make_application(&chain2, &application_id)
-            .await?,
-    );
+    let app2 = NonFungibleApp(node_service2.make_application(&chain2, &application_id)?);
 
     // Checking that the NFT is on chain2 now, with the same owner
     assert_eq!(app2.get_nft(&nft1_id).await?, expected_nft1);
@@ -1088,20 +2797,22 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
 
     // Claiming another NFT from chain2 to chain1.
     app1.claim(
-        &fungible::Account {
+        &Account {
             chain_id: chain2,
             owner: account_owner1,
         },
         &nft1_id,
-        &fungible::Account {
+        &Account {
             chain_id: chain1,
             owner: account_owner1,
         },
     )
     .await;
 
-    // Make sure that the cross-chain communication happens fast enough.
+    // Let chain 2 process the claim and then chain 1 process the credit.
+    notifications2.wait_for_bundle(chain1, None).await?;
     assert_eq!(node_service2.process_inbox(&chain2).await?.len(), 1);
+    notifications1.wait_for_bundle(chain2, None).await?;
     assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
 
     // Checking the NFT is removed from chain2
@@ -1120,7 +2831,7 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
     app1.transfer(
         &account_owner1,
         &nft1_id,
-        &fungible::Account {
+        &Account {
             chain_id: chain2,
             owner: account_owner2,
         },
@@ -1128,6 +2839,7 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
     .await;
 
     // The transfer is received by chain2 and needs to be processed.
+    notifications2.wait_for_bundle(chain1, None).await?;
     assert_eq!(node_service2.process_inbox(&chain2).await?.len(), 1);
 
     // Checking the NFT is removed from chain1
@@ -1184,11 +2896,11 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
         .await?
         .contains(&nft2_id));
 
-    // Transferring to another chain, maitaining the owner
+    // Transferring to another chain, maintaining the owner
     app2.transfer(
         &account_owner2,
         &nft2_id,
-        &fungible::Account {
+        &Account {
             chain_id: chain1,
             owner: account_owner2,
         },
@@ -1196,6 +2908,7 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
     .await;
 
     // The transfer from chain2 has to be received from chain1.
+    notifications1.wait_for_bundle(chain2, None).await?;
     assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
 
     // Checking the NFT is removed from chain2
@@ -1213,20 +2926,22 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
 
     // Claiming another NFT from chain1 to chain2.
     app2.claim(
-        &fungible::Account {
+        &Account {
             chain_id: chain1,
             owner: account_owner2,
         },
         &nft2_id,
-        &fungible::Account {
+        &Account {
             chain_id: chain2,
             owner: account_owner2,
         },
     )
     .await;
 
-    // Make sure that the cross-chain communication happens fast enough.
+    // Let chain 1 process the claim and then chain 2 process the credit.
+    notifications1.wait_for_bundle(chain2, None).await?;
     assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
+    notifications2.wait_for_bundle(chain1, None).await?;
     assert_eq!(node_service2.process_inbox(&chain2).await?.len(), 1);
 
     // Checking the final state
@@ -1255,8 +2970,7 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Result<()> {
     use std::collections::BTreeMap;
@@ -1271,14 +2985,14 @@ async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Res
     let (mut net, client1) = config.instantiate().await?;
 
     let client2 = net.make_client().await;
-    client2.wallet_init(&[], FaucetOption::None).await?;
+    client2.wallet_init(None).await?;
 
     let chain1 = client1.load_wallet()?.default_chain().unwrap();
     let chain2 = client1.open_and_assign(&client2, Amount::ONE).await?;
 
     // The players
-    let account_owner1 = get_fungible_account_owner(&client1); // operator
-    let account_owner2 = get_fungible_account_owner(&client2); // contributor
+    let account_owner1 = get_account_owner(&client1); // operator
+    let account_owner2 = get_account_owner(&client2); // contributor
 
     // The initial accounts on chain1
     let accounts = BTreeMap::from([(account_owner1, Amount::from_tokens(6))]);
@@ -1291,6 +3005,7 @@ async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Res
         .publish_and_create::<FungibleTokenAbi, Parameters, InitialState>(
             contract_fungible,
             service_fungible,
+            VmRuntime::Wasm,
             &params,
             &state_fungible,
             &[],
@@ -1311,7 +3026,7 @@ async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Res
         .publish_and_create::<CrowdFundingAbi, ApplicationId<FungibleTokenAbi>, InstantiationArgument>(
             contract_crowd,
             service_crowd,
-            // TODO(#723): This hack will disappear soon.
+            VmRuntime::Wasm,
             &application_id_fungible,
             &state_crowd,
             &[application_id_fungible.forget_abi()],
@@ -1323,42 +3038,31 @@ async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Res
     let port2 = get_node_port().await;
     let mut node_service1 = client1.run_node_service(port1, ProcessInbox::Skip).await?;
     let mut node_service2 = client2.run_node_service(port2, ProcessInbox::Skip).await?;
+    let mut notifications1 = node_service1.notifications(chain1).await?;
+    let mut notifications2 = node_service2.notifications(chain2).await?;
 
-    let app_fungible1 = FungibleApp(
-        node_service1
-            .make_application(&chain1, &application_id_fungible)
-            .await?,
-    );
+    let app_fungible1 =
+        FungibleApp(node_service1.make_application(&chain1, &application_id_fungible)?);
 
-    let app_crowd1 = node_service1
-        .make_application(&chain1, &application_id_crowd)
-        .await?;
+    let app_crowd1 = node_service1.make_application(&chain1, &application_id_crowd)?;
 
     // Transferring tokens to user2 on chain2
     app_fungible1
         .transfer(
             &account_owner1,
             Amount::ONE,
-            fungible::Account {
+            Account {
                 chain_id: chain2,
                 owner: account_owner2,
             },
         )
         .await;
 
-    // Register the campaign on chain2.
-    node_service2
-        .request_application(&chain2, &application_id_crowd)
-        .await?;
-
-    // Chain2 requests the application from chain1, so chain1 has
-    // to receive the request and then chain2 receive the answer.
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
+    // Make sure that the transfer is received before we try to pledge.
+    notifications2.wait_for_bundle(chain1, None).await?;
     assert_eq!(node_service2.process_inbox(&chain2).await?.len(), 1);
 
-    let app_crowd2 = node_service2
-        .make_application(&chain2, &application_id_crowd)
-        .await?;
+    let app_crowd2 = node_service2.make_application(&chain2, &application_id_crowd)?;
 
     // Transferring
     let mutation = format!(
@@ -1368,7 +3072,8 @@ async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Res
     );
     app_crowd2.mutate(mutation).await?;
 
-    // Make sure that the pledge is processed fast enough by client1.
+    // Let client1 process the pledge.
+    notifications1.wait_for_bundle(chain2, None).await?;
     assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
 
     // Ending the campaign.
@@ -1391,8 +3096,7 @@ async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Res
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> Result<()> {
     use std::collections::BTreeMap;
@@ -1407,8 +3111,8 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
     let client_a = net.make_client().await;
     let client_b = net.make_client().await;
 
-    client_a.wallet_init(&[], FaucetOption::None).await?;
-    client_b.wallet_init(&[], FaucetOption::None).await?;
+    client_a.wallet_init(None).await?;
+    client_b.wallet_init(None).await?;
 
     // Create initial server and client config.
     let (contract_fungible_a, service_fungible_a) = client_a.build_example("fungible").await?;
@@ -1421,9 +3125,9 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
     let chain_b = client_admin.open_and_assign(&client_b, Amount::ONE).await?;
 
     // The players
-    let owner_admin = get_fungible_account_owner(&client_admin);
-    let owner_a = get_fungible_account_owner(&client_a);
-    let owner_b = get_fungible_account_owner(&client_b);
+    let owner_admin = get_account_owner(&client_admin);
+    let owner_a = get_account_owner(&client_a);
+    let owner_b = get_account_owner(&client_b);
     // The initial accounts on chain_a and chain_b
     let accounts0 = BTreeMap::from([(owner_a, Amount::from_tokens(10))]);
     let state_fungible0 = fungible::InitialState {
@@ -1440,6 +3144,7 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
         .publish_and_create::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>(
             contract_fungible_a,
             service_fungible_a,
+            VmRuntime::Wasm,
             &params0,
             &state_fungible0,
             &[],
@@ -1451,6 +3156,7 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
         .publish_and_create::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>(
             contract_fungible_b,
             service_fungible_b,
+            VmRuntime::Wasm,
             &params1,
             &state_fungible1,
             &[],
@@ -1463,36 +3169,22 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
     let port2 = get_node_port().await;
     let port3 = get_node_port().await;
     let mut node_service_admin = client_admin
-        .run_node_service(port1, ProcessInbox::Skip)
+        .run_node_service(port1, ProcessInbox::Automatic)
         .await?;
-    let mut node_service_a = client_a.run_node_service(port2, ProcessInbox::Skip).await?;
-    let mut node_service_b = client_b.run_node_service(port3, ProcessInbox::Skip).await?;
-
-    node_service_a
-        .request_application(&chain_a, &token1)
+    let mut node_service_a = client_a
+        .run_node_service(port2, ProcessInbox::Automatic)
         .await?;
-    node_service_b
-        .request_application(&chain_b, &token0)
-        .await?;
-    node_service_admin
-        .request_application(&chain_admin, &token0)
-        .await?;
-    node_service_admin
-        .request_application(&chain_admin, &token1)
+    let mut node_service_b = client_b
+        .run_node_service(port3, ProcessInbox::Automatic)
         .await?;
 
-    // In an operation node_service_a.request_application(&chain_a, app_b)
-    // chain_b needs to process the request first and then chain_a
-    // the answer.
-    node_service_a.process_inbox(&chain_a).await?;
-    node_service_b.process_inbox(&chain_b).await?;
-    node_service_a.process_inbox(&chain_a).await?;
-    node_service_admin.process_inbox(&chain_admin).await?;
+    let mut notifications_a = node_service_a.notifications(chain_a).await?;
+    let mut notifications_b = node_service_b.notifications(chain_b).await?;
 
-    let app_fungible0_a = FungibleApp(node_service_a.make_application(&chain_a, &token0).await?);
-    let app_fungible1_a = FungibleApp(node_service_a.make_application(&chain_a, &token1).await?);
-    let app_fungible0_b = FungibleApp(node_service_b.make_application(&chain_b, &token0).await?);
-    let app_fungible1_b = FungibleApp(node_service_b.make_application(&chain_b, &token1).await?);
+    let app_fungible0_a = FungibleApp(node_service_a.make_application(&chain_a, &token0)?);
+    let app_fungible1_a = FungibleApp(node_service_a.make_application(&chain_a, &token1)?);
+    let app_fungible0_b = FungibleApp(node_service_b.make_application(&chain_b, &token0)?);
+    let app_fungible1_b = FungibleApp(node_service_b.make_application(&chain_b, &token1)?);
     app_fungible0_a
         .assert_balances([
             (owner_a, Amount::from_tokens(10)),
@@ -1507,16 +3199,10 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
             (owner_admin, Amount::ZERO),
         ])
         .await;
-    let app_fungible0_admin = FungibleApp(
-        node_service_admin
-            .make_application(&chain_admin, &token0)
-            .await?,
-    );
-    let app_fungible1_admin = FungibleApp(
-        node_service_admin
-            .make_application(&chain_admin, &token1)
-            .await?,
-    );
+    let app_fungible0_admin =
+        FungibleApp(node_service_admin.make_application(&chain_admin, &token0)?);
+    let app_fungible1_admin =
+        FungibleApp(node_service_admin.make_application(&chain_admin, &token1)?);
     app_fungible0_admin
         .assert_balances([
             (owner_a, Amount::ZERO),
@@ -1535,54 +3221,33 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
     // Setting up the application matching engine.
     let parameter = Parameters {
         tokens: [token0, token1],
+        price_decimals: 0,
     };
-    let bytecode_id = node_service_admin
-        .publish_bytecode::<MatchingEngineAbi, Parameters, ()>(
+    let module_id = node_service_admin
+        .publish_module::<MatchingEngineAbi, Parameters, ()>(
             &chain_admin,
             contract_matching,
             service_matching,
+            VmRuntime::Wasm,
         )
         .await?;
     let application_id_matching = node_service_admin
         .create_application(
             &chain_admin,
-            &bytecode_id,
+            &module_id,
             &parameter,
             &(),
             &[token0.forget_abi(), token1.forget_abi()],
         )
         .await?;
     let app_matching_admin = MatchingEngineApp(
-        node_service_admin
-            .make_application(&chain_admin, &application_id_matching)
-            .await?,
+        node_service_admin.make_application(&chain_admin, &application_id_matching)?,
     );
-    node_service_a
-        .request_application(&chain_a, &application_id_matching)
-        .await?;
-    node_service_b
-        .request_application(&chain_b, &application_id_matching)
-        .await?;
 
-    // First chain_admin needs to process the two requests and
-    // then chain_a / chain_b the answers.
-    assert_eq!(
-        node_service_admin.process_inbox(&chain_admin).await?.len(),
-        1
-    );
-    assert_eq!(node_service_a.process_inbox(&chain_a).await?.len(), 1);
-    assert_eq!(node_service_b.process_inbox(&chain_b).await?.len(), 1);
-
-    let app_matching_a = MatchingEngineApp(
-        node_service_a
-            .make_application(&chain_a, &application_id_matching)
-            .await?,
-    );
-    let app_matching_b = MatchingEngineApp(
-        node_service_b
-            .make_application(&chain_b, &application_id_matching)
-            .await?,
-    );
+    let app_matching_a =
+        MatchingEngineApp(node_service_a.make_application(&chain_a, &application_id_matching)?);
+    let app_matching_b =
+        MatchingEngineApp(node_service_b.make_application(&chain_b, &application_id_matching)?);
 
     // Now creating orders
     for price in [1, 2] {
@@ -1590,7 +3255,7 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
         app_matching_a
             .order(matching_engine::Order::Insert {
                 owner: owner_a,
-                amount: Amount::from_tokens(3),
+                quantity: Amount::from_tokens(3),
                 nature: OrderNature::Bid,
                 price: Price { price },
             })
@@ -1601,21 +3266,17 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
         app_matching_b
             .order(matching_engine::Order::Insert {
                 owner: owner_b,
-                amount: Amount::from_tokens(4),
+                quantity: Amount::from_tokens(4),
                 nature: OrderNature::Ask,
                 price: Price { price },
             })
             .await;
     }
-    // The orders are sent on chain_a / chain_b. First they are
-    // rerouted to the admin chain for processing. This leads
-    // to order being sent to chain_a / chain_b.
-    assert_eq!(
-        node_service_admin.process_inbox(&chain_admin).await?.len(),
-        1
-    );
-    assert_eq!(node_service_a.process_inbox(&chain_a).await?.len(), 1);
-    assert_eq!(node_service_b.process_inbox(&chain_b).await?.len(), 1);
+    // Chains a and b receive their swapped tokens from the admin chain.
+    notifications_a.wait_for_bundle(chain_admin, None).await?;
+    notifications_a.wait_for_block(None).await?;
+    notifications_b.wait_for_bundle(chain_admin, None).await?;
+    notifications_b.wait_for_block(None).await?;
 
     // Now reading the order_ids
     let order_ids_a = app_matching_admin.get_account_info(&owner_a).await;
@@ -1642,13 +3303,15 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
             .await;
     }
 
-    // Same logic as for the insertion of orders.
-    assert_eq!(
-        node_service_admin.process_inbox(&chain_admin).await?.len(),
-        1
-    );
-    assert_eq!(node_service_a.process_inbox(&chain_a).await?.len(), 1);
-    assert_eq!(node_service_b.process_inbox(&chain_b).await?.len(), 1);
+    // Chain a will receive one message with a refund, chain b will get two.
+    notifications_a.wait_for_bundle(chain_admin, None).await?;
+    notifications_a.wait_for_block(None).await?;
+    notifications_b.wait_for_bundle(chain_admin, None).await?;
+    notifications_b.wait_for_bundle(chain_admin, None).await?;
+    notifications_b.wait_for_block(None).await?;
+    // Depending on timing, chain b may process the two bundles in one or two blocks, so
+    // we explicitly process the inbox to be sure.
+    node_service_b.process_inbox(&chain_b).await?;
 
     // Check balances
     app_fungible0_a
@@ -1682,14 +3345,15 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(all(feature = "rocksdb", feature = "scylladb"), test_case(LocalNetConfig::new_test(Database::DualRocksDbScyllaDb, Network::Grpc) ; "dualrocksdbscylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
     use std::collections::BTreeMap;
 
     use amm::{AmmAbi, Parameters};
+
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
 
@@ -1697,8 +3361,8 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
 
     let client0 = net.make_client().await;
     let client1 = net.make_client().await;
-    client0.wallet_init(&[], FaucetOption::None).await?;
-    client1.wallet_init(&[], FaucetOption::None).await?;
+    client0.wallet_init(None).await?;
+    client1.wallet_init(None).await?;
 
     let (contract_fungible, service_fungible) = client_amm.build_example("fungible").await?;
     let (contract_amm, service_amm) = client_amm.build_example("amm").await?;
@@ -1711,11 +3375,11 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
     let chain1 = client_amm.open_and_assign(&client1, Amount::ONE).await?;
 
     // AMM user
-    let owner_amm_chain = get_fungible_account_owner(&client_amm);
+    let owner_amm_chain = get_account_owner(&client_amm);
 
     // Users
-    let owner0 = get_fungible_account_owner(&client0);
-    let owner1 = get_fungible_account_owner(&client1);
+    let owner0 = get_account_owner(&client0);
+    let owner1 = get_account_owner(&client1);
 
     let port1 = get_node_port().await;
     let port2 = get_node_port().await;
@@ -1725,6 +3389,9 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .await?;
     let mut node_service0 = client0.run_node_service(port2, ProcessInbox::Skip).await?;
     let mut node_service1 = client1.run_node_service(port3, ProcessInbox::Skip).await?;
+    let mut notifications_amm = node_service_amm.notifications(chain_amm).await?;
+    let mut notifications0 = node_service0.notifications(chain0).await?;
+    let mut notifications1 = node_service1.notifications(chain1).await?;
 
     // Amounts of token0 that will be owned by each user
     let state_fungible0 = fungible::InitialState {
@@ -1738,18 +3405,20 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
 
     // Create fungible applications on the AMM chain, which will hold
     // the token0 and token1 amounts
-    let fungible_bytecode_id = node_service_amm
-        .publish_bytecode::<
-            fungible::FungibleTokenAbi,
-            fungible::Parameters,
-            fungible::InitialState
-        >(&chain_amm, contract_fungible, service_fungible).await?;
+    let fungible_module_id = node_service_amm
+        .publish_module::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>(
+            &chain_amm,
+            contract_fungible,
+            service_fungible,
+            VmRuntime::Wasm,
+        )
+        .await?;
 
     let params0 = fungible::Parameters::new("ZERO");
     let token0 = node_service_amm
         .create_application(
             &chain_amm,
-            &fungible_bytecode_id,
+            &fungible_module_id,
             &params0,
             &state_fungible0,
             &[],
@@ -1759,7 +3428,7 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
     let token1 = node_service_amm
         .create_application(
             &chain_amm,
-            &fungible_bytecode_id,
+            &fungible_module_id,
             &params1,
             &state_fungible1,
             &[],
@@ -1767,23 +3436,15 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .await?;
 
     // Create wrappers
-    let app_fungible0_amm = FungibleApp(
-        node_service_amm
-            .make_application(&chain_amm, &token0)
-            .await?,
-    );
-    let app_fungible1_amm = FungibleApp(
-        node_service_amm
-            .make_application(&chain_amm, &token1)
-            .await?,
-    );
+    let app_fungible0_amm = FungibleApp(node_service_amm.make_application(&chain_amm, &token0)?);
+    let app_fungible1_amm = FungibleApp(node_service_amm.make_application(&chain_amm, &token1)?);
 
     // Sending tokens to proper chains
     app_fungible0_amm
         .transfer(
             &owner_amm_chain,
             Amount::from_tokens(100),
-            fungible::Account {
+            Account {
                 chain_id: chain0,
                 owner: owner0,
             },
@@ -1793,7 +3454,7 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .transfer(
             &owner_amm_chain,
             Amount::from_tokens(170),
-            fungible::Account {
+            Account {
                 chain_id: chain1,
                 owner: owner1,
             },
@@ -1804,31 +3465,41 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .transfer(
             &owner_amm_chain,
             Amount::from_tokens(150),
-            fungible::Account {
+            Account {
                 chain_id: chain0,
                 owner: owner0,
             },
         )
         .await;
+    let (_, msg0_height) = node_service_amm.chain_tip(chain_amm).await?.unwrap();
     app_fungible1_amm
         .transfer(
             &owner_amm_chain,
             Amount::from_tokens(100),
-            fungible::Account {
+            Account {
                 chain_id: chain1,
                 owner: owner1,
             },
         )
         .await;
+    let (_, msg1_height) = node_service_amm.chain_tip(chain_amm).await?.unwrap();
 
+    // The chains receive multiple bundles. Wait for the notifications about the last ones, so
+    // that process_inbox processes all of them.
+    notifications0
+        .wait_for_bundle(chain_amm, msg0_height)
+        .await?;
     assert_eq!(node_service0.process_inbox(&chain0).await?.len(), 1);
+    notifications1
+        .wait_for_bundle(chain_amm, msg1_height)
+        .await?;
     assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
 
-    let app_fungible0_0 = FungibleApp(node_service0.make_application(&chain0, &token0).await?);
-    let app_fungible1_0 = FungibleApp(node_service0.make_application(&chain0, &token1).await?);
+    let app_fungible0_0 = FungibleApp(node_service0.make_application(&chain0, &token0)?);
+    let app_fungible1_0 = FungibleApp(node_service0.make_application(&chain0, &token1)?);
 
-    let app_fungible0_1 = FungibleApp(node_service1.make_application(&chain1, &token0).await?);
-    let app_fungible1_1 = FungibleApp(node_service1.make_application(&chain1, &token1).await?);
+    let app_fungible0_1 = FungibleApp(node_service1.make_application(&chain1, &token0)?);
+    let app_fungible1_1 = FungibleApp(node_service1.make_application(&chain1, &token1)?);
 
     // Check initial balances
     app_fungible0_amm
@@ -1881,50 +3552,31 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
     };
 
     // Create AMM application on Admin chain
-    let bytecode_id = node_service_amm
-        .publish_bytecode::<AmmAbi, Parameters, ()>(&chain_amm, contract_amm, service_amm)
+    let module_id = node_service_amm
+        .publish_module::<AmmAbi, Parameters, ()>(
+            &chain_amm,
+            contract_amm,
+            service_amm,
+            VmRuntime::Wasm,
+        )
         .await?;
     let application_id_amm = node_service_amm
         .create_application(
             &chain_amm,
-            &bytecode_id,
+            &module_id,
             &parameters,
             &(),
             &[token0.forget_abi(), token1.forget_abi()],
         )
         .await?;
 
-    let owner_amm_app = AccountOwner::Application(application_id_amm.forget_abi());
+    let owner_amm_app = application_id_amm.into();
 
     // Create AMM wrappers
-    let app_amm = AmmApp(
-        node_service_amm
-            .make_application(&chain_amm, &application_id_amm)
-            .await?,
-    );
-    node_service0
-        .request_application(&chain0, &application_id_amm)
-        .await?;
-    node_service1
-        .request_application(&chain1, &application_id_amm)
-        .await?;
+    let app_amm = AmmApp(node_service_amm.make_application(&chain_amm, &application_id_amm)?);
 
-    // The chain_amm must first requests those two requests
-    // and then chain0 / chain1 must handle the answers.
-    assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
-    assert_eq!(node_service0.process_inbox(&chain0).await?.len(), 1);
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
-
-    let app_amm0 = AmmApp(
-        node_service0
-            .make_application(&chain0, &application_id_amm)
-            .await?,
-    );
-    let app_amm1 = AmmApp(
-        node_service1
-            .make_application(&chain1, &application_id_amm)
-            .await?,
-    );
+    let app_amm0 = AmmApp(node_service0.make_application(&chain0, &application_id_amm)?);
+    let app_amm1 = AmmApp(node_service1.make_application(&chain1, &application_id_amm)?);
 
     // Initial balances for both tokens are 0
     app_amm
@@ -1937,6 +3589,7 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .add_liquidity(owner0, Amount::from_tokens(100), Amount::from_tokens(100))
         .await?;
 
+    notifications_amm.wait_for_bundle(chain0, None).await?;
     assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
 
     // Ownership of the used owner_amm_chain's tokens should be with the AMM now
@@ -1996,7 +3649,9 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .add_liquidity(owner1, Amount::from_tokens(120), Amount::from_tokens(100))
         .await?;
 
+    notifications_amm.wait_for_bundle(chain1, None).await?;
     assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
+    notifications1.wait_for_bundle(chain_amm, None).await?;
     assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
 
     app_fungible0_amm
@@ -2056,7 +3711,9 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .expect_err("Swapping from the AMM chain should fail");
 
     app_amm1.swap(owner1, 0, Amount::from_tokens(50)).await?;
+    notifications_amm.wait_for_bundle(chain1, None).await?;
     assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
+    notifications1.wait_for_bundle(chain_amm, None).await?;
     assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
 
     app_fungible0_amm
@@ -2125,8 +3782,8 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
     app_amm1
         .remove_liquidity(owner1, 0, Amount::from_tokens(500))
         .await?;
+    notifications_amm.wait_for_bundle(chain1, None).await?;
     assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 0);
 
     // Balances will be unaltered
     app_fungible0_amm
@@ -2181,7 +3838,9 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .await;
 
     app_amm1.swap(owner1, 1, Amount::from_tokens(40)).await?;
+    notifications_amm.wait_for_bundle(chain1, None).await?;
     assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
+    notifications1.wait_for_bundle(chain_amm, None).await?;
     assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
 
     app_fungible0_amm
@@ -2238,7 +3897,10 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
     app_amm1
         .remove_liquidity(owner1, 0, Amount::from_tokens(100))
         .await?;
+
+    notifications_amm.wait_for_bundle(chain1, None).await?;
     assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
+    notifications1.wait_for_bundle(chain_amm, None).await?;
     assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
 
     app_fungible0_amm
@@ -2293,7 +3955,9 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .await;
 
     app_amm0.swap(owner0, 1, Amount::from_tokens(25)).await?;
+    notifications_amm.wait_for_bundle(chain0, None).await?;
     assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
+    notifications0.wait_for_bundle(chain_amm, None).await?;
     assert_eq!(node_service0.process_inbox(&chain0).await?.len(), 1);
 
     app_fungible0_amm
@@ -2348,7 +4012,9 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .await;
 
     app_amm0.remove_all_added_liquidity(owner0).await?;
+    notifications_amm.wait_for_bundle(chain0, None).await?;
     assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
+    notifications0.wait_for_bundle(chain_amm, None).await?;
     assert_eq!(node_service0.process_inbox(&chain0).await?.len(), 1);
 
     app_fungible0_amm
@@ -2412,42 +4078,24 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
     Ok(())
 }
 
-#[test_log::test(tokio::test)]
-async fn test_resolve_binary() -> Result<()> {
-    resolve_binary("linera", env!("CARGO_PKG_NAME")).await?;
-    resolve_binary("linera-proxy", env!("CARGO_PKG_NAME")).await?;
-    assert!(resolve_binary("linera-spaceship", env!("CARGO_PKG_NAME"))
-        .await
-        .is_err());
-
-    Ok(())
-}
-
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_open_chain_node_service(config: impl LineraNetConfig) -> Result<()> {
     use std::collections::BTreeMap;
+
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
 
     let (mut net, client) = config.instantiate().await?;
 
     let chain1 = client.load_wallet()?.default_chain().unwrap();
-    let public_key = client
-        .load_wallet()?
-        .get(chain1)
-        .unwrap()
-        .key_pair
-        .as_ref()
-        .unwrap()
-        .public();
+    let owner1 = client.load_wallet()?.get(chain1).unwrap().owner.unwrap();
 
     // Create a fungible token application with 10 tokens for owner 1.
-    let owner = get_fungible_account_owner(&client);
+    let owner = get_account_owner(&client);
     let accounts = BTreeMap::from([(owner, Amount::from_tokens(10))]);
     let state = fungible::InitialState { accounts };
     let (contract, service) = client.build_example("fungible").await?;
@@ -2456,6 +4104,7 @@ async fn test_open_chain_node_service(config: impl LineraNetConfig) -> Result<()
         .publish_and_create::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>(
             contract,
             service,
+            VmRuntime::Wasm,
             &params,
             &state,
             &[],
@@ -2468,13 +4117,14 @@ async fn test_open_chain_node_service(config: impl LineraNetConfig) -> Result<()
     let node_service = client
         .run_node_service(port, ProcessInbox::Automatic)
         .await?;
+    let mut notifications1 = node_service.notifications(chain1).await?;
 
     // Open a new chain with the same public key.
     // The node service should automatically create a client for it internally.
     let query = format!(
         "mutation {{ openChain(\
             chainId:\"{chain1}\", \
-            publicKey:\"{public_key}\", \
+            owner:\"{owner1}\", \
             balance: \"1\"\
         ) }}"
     );
@@ -2488,68 +4138,60 @@ async fn test_open_chain_node_service(config: impl LineraNetConfig) -> Result<()
     let query = format!(
         "mutation {{ openMultiOwnerChain(\
             chainId: \"{chain1}\", \
-            publicKeys: [\"{public_key}\"], \
+            owners: [\"{owner1}\"], \
             applicationPermissions: {{ executeOperations: [\"{raw_app_id}\"] }}, \
             balance: \"1\"
         ) }}"
     );
     let data = node_service.query_node(query).await?;
     let chain2: ChainId = serde_json::from_value(data["openMultiOwnerChain"].clone())?;
+    let mut notifications2 = node_service.notifications(chain2).await?;
 
     // Send 8 tokens to the new chain.
-    let app1 = FungibleApp(
-        node_service
-            .make_application(&chain1, &application_id)
-            .await?,
-    );
+    let app1 = FungibleApp(node_service.make_application(&chain1, &application_id)?);
     app1.transfer(
         &owner,
         Amount::from_tokens(8),
-        fungible::Account {
+        Account {
             chain_id: chain2,
             owner,
         },
     )
     .await;
 
-    // The chain2 must process the received transfer
-    node_service.process_inbox(&chain2).await?;
+    // The chain2 must receive the transfer and automatically process it in a new block.
+    let app2 = FungibleApp(node_service.make_application(&chain2, &application_id)?);
+    notifications2.wait_for_block(BlockHeight::ZERO).await?;
+    assert_eq!(app2.get_amount(&owner).await, Amount::from_tokens(8));
+    let (_, height1) = node_service.chain_tip(chain1).await?.unwrap();
 
     // Send 4 tokens back.
-    let app2 = FungibleApp(
-        node_service
-            .make_application(&chain2, &application_id)
-            .await?,
-    );
     app2.transfer(
         &owner,
         Amount::from_tokens(4),
-        fungible::Account {
+        Account {
             chain_id: chain1,
             owner,
         },
     )
     .await;
 
+    // Now chain1 must process the transfer in a new block.
+    notifications1
+        .wait_for_block(height1.try_add_one()?)
+        .await?;
     // Verify that the default chain now has 6 and the new one has 4 tokens.
-    for i in 0..10 {
-        linera_base::time::timer::sleep(Duration::from_secs(i)).await;
-        let balance1 = app1.get_amount(&owner).await;
-        let balance2 = app2.get_amount(&owner).await;
-        if balance1 == Amount::from_tokens(6) && balance2 == Amount::from_tokens(4) {
-            net.ensure_is_running().await?;
-            net.terminate().await?;
-            return Ok(());
-        }
-    }
-    panic!("Failed to receive new block");
+    assert_eq!(app1.get_amount(&owner).await, Amount::from_tokens(6));
+    assert_eq!(app2.get_amount(&owner).await, Amount::from_tokens(4));
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+    Ok(())
 }
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_multiple_wallets(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -2559,21 +4201,21 @@ async fn test_end_to_end_multiple_wallets(config: impl LineraNetConfig) -> Resul
     let (mut net, client1) = config.instantiate().await?;
 
     let client2 = net.make_client().await;
-    client2.wallet_init(&[], FaucetOption::None).await?;
+    client2.wallet_init(None).await?;
 
     // Get some chain owned by Client 1.
-    let chain1 = *client1.load_wallet()?.chain_ids().first().unwrap();
+    let chain1 = *client1.load_wallet()?.owned_chain_ids().first().unwrap();
 
     // Generate a key for Client 2.
-    let client2_key = client2.keygen().await?;
+    let owner2 = client2.keygen().await?;
 
     // Open chain on behalf of Client 2.
-    let (message_id, chain2) = client1
-        .open_chain(chain1, Some(client2_key), Amount::ZERO)
+    let (chain2, _) = client1
+        .open_chain(chain1, Some(owner2), Amount::ZERO)
         .await?;
 
     // Assign chain2 to client2_key.
-    assert_eq!(chain2, client2.assign(client2_key, message_id).await?);
+    client2.assign(owner2, chain2).await?;
 
     // Transfer a token to chain 2. Check that this increases the local balance, proving
     // that client 2 can create blocks on that chain.
@@ -2594,8 +4236,7 @@ async fn test_end_to_end_multiple_wallets(config: impl LineraNetConfig) -> Resul
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_open_multi_owner_chain(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -2605,19 +4246,19 @@ async fn test_end_to_end_open_multi_owner_chain(config: impl LineraNetConfig) ->
     let (mut net, client1) = config.instantiate().await?;
 
     let client2 = net.make_client().await;
-    client2.wallet_init(&[], FaucetOption::None).await?;
+    client2.wallet_init(None).await?;
 
-    let chain1 = *client1.load_wallet()?.chain_ids().first().unwrap();
+    let chain1 = *client1.load_wallet()?.owned_chain_ids().first().unwrap();
 
     // Generate keys for both clients.
-    let client1_key = client1.keygen().await?;
-    let client2_key = client2.keygen().await?;
+    let owner1 = client1.keygen().await?;
+    let owner2 = client2.keygen().await?;
 
     // Open a chain owned by both clients.
-    let (message_id, chain2) = client1
+    let chain2 = client1
         .open_multi_owner_chain(
             chain1,
-            vec![client1_key, client2_key],
+            vec![owner1, owner2],
             vec![100, 100],
             u32::MAX,
             Amount::from_tokens(6),
@@ -2626,10 +4267,10 @@ async fn test_end_to_end_open_multi_owner_chain(config: impl LineraNetConfig) ->
         .await?;
 
     // Assign chain2 to client1_key.
-    assert_eq!(chain2, client1.assign(client1_key, message_id).await?);
+    client1.assign(owner1, chain2).await?;
 
     // Assign chain2 to client2_key.
-    assert_eq!(chain2, client2.assign(client2_key, message_id).await?);
+    client2.assign(owner2, chain2).await?;
 
     client2.sync(chain2).await?;
 
@@ -2663,11 +4304,11 @@ async fn test_end_to_end_open_multi_owner_chain(config: impl LineraNetConfig) ->
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_change_ownership(config: impl LineraNetConfig) -> Result<()> {
-    use linera_base::crypto::PublicKey;
+    use linera_base::crypto::AccountPublicKey;
+
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
 
@@ -2675,25 +4316,24 @@ async fn test_end_to_end_change_ownership(config: impl LineraNetConfig) -> Resul
     let (mut net, client) = config.instantiate().await?;
 
     let chain = client.load_wallet()?.default_chain().unwrap();
-    let pub_key1 = {
+    let owner1 = {
         let wallet = client.load_wallet()?;
         let user_chain = wallet.get(chain).unwrap();
-        user_chain.key_pair.as_ref().unwrap().public()
+        user_chain.owner.unwrap()
     };
-    let pub_key2 = PublicKey::test_key(2);
+    // Generate an owner for which we don't have a secret key in the Signer.
+    let owner2 = AccountPublicKey::test_key(2).into();
 
     // Make both keys owners.
     client
-        .change_ownership(chain, vec![], vec![pub_key1, pub_key2])
+        .change_ownership(chain, vec![], vec![owner1, owner2])
         .await?;
 
-    // Make pub_key2 the only (super) owner.
-    client
-        .change_ownership(chain, vec![pub_key2], vec![])
-        .await?;
-
+    // Make owner2 the only (super) owner.
+    client.change_ownership(chain, vec![owner2], vec![]).await?;
+    client.set_preferred_owner(chain, Some(owner2)).await?;
     // Now we're not the owner anymore.
-    let result = client.change_ownership(chain, vec![], vec![pub_key1]).await;
+    let result = client.change_ownership(chain, vec![], vec![owner1]).await;
     assert_matches::assert_matches!(result, Err(_));
 
     net.ensure_is_running().await?;
@@ -2705,8 +4345,7 @@ async fn test_end_to_end_change_ownership(config: impl LineraNetConfig) -> Resul
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_assign_greatgrandchild_chain(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -2716,22 +4355,25 @@ async fn test_end_to_end_assign_greatgrandchild_chain(config: impl LineraNetConf
     let (mut net, client1) = config.instantiate().await?;
 
     let client2 = net.make_client().await;
-    client2.wallet_init(&[], FaucetOption::None).await?;
+    client2.wallet_init(None).await?;
 
-    let chain1 = *client1.load_wallet()?.chain_ids().first().unwrap();
+    let client3 = net.make_client().await;
+    client3.wallet_init(None).await?;
+
+    let chain1 = *client1.load_wallet()?.owned_chain_ids().first().unwrap();
 
     // Generate keys for client 2.
-    let client2_key = client2.keygen().await?;
+    let owner2 = client2.keygen().await?;
 
     // Open a great-grandchild chain on behalf of client 2.
-    let (_, grandparent) = client1
+    let (grandparent, _) = client1
         .open_chain(chain1, None, Amount::from_tokens(2))
         .await?;
-    let (_, parent) = client1.open_chain(grandparent, None, Amount::ONE).await?;
-    let (message_id, chain2) = client1
-        .open_chain(parent, Some(client2_key), Amount::ZERO)
+    let (parent, _) = client1.open_chain(grandparent, None, Amount::ONE).await?;
+    let (chain2, _) = client1
+        .open_chain(parent, Some(owner2), Amount::ZERO)
         .await?;
-    client2.assign(client2_key, message_id).await?;
+    client2.assign(owner2, chain2).await?;
 
     // Transfer a token to chain 2. Check that this increases the local balance, proving
     // that client 2 can create blocks on that chain.
@@ -2742,6 +4384,17 @@ async fn test_end_to_end_assign_greatgrandchild_chain(config: impl LineraNetConf
     client2.process_inbox(chain2).await?;
     assert!(client2.local_balance(account2).await? > Amount::ZERO);
 
+    // Verify that a third party can also follow the chain.
+    client3.follow_chain(chain2, true).await?;
+    assert!(client3.local_balance(account2).await? > Amount::ZERO);
+    assert!(client3.load_wallet()?.chain_ids().contains(&chain2));
+
+    // Verify that trying to follow a chain that does not exist will fail, even without --sync.
+    let wrong_id = ChainId(CryptoHash::test_hash("wrong chain ID"));
+    let result = client3.follow_chain(wrong_id, false).await;
+    assert!(result.is_err());
+    assert!(!client3.load_wallet()?.chain_ids().contains(&wrong_id));
+
     net.ensure_is_running().await?;
     net.terminate().await?;
 
@@ -2751,8 +4404,7 @@ async fn test_end_to_end_assign_greatgrandchild_chain(config: impl LineraNetConf
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_publish_data_blob_in_cli(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -2762,7 +4414,7 @@ async fn test_end_to_end_publish_data_blob_in_cli(config: impl LineraNetConfig) 
     let (mut net, client1) = config.instantiate().await?;
 
     let client2 = net.make_client().await;
-    client2.wallet_init(&[], FaucetOption::None).await?;
+    client2.wallet_init(None).await?;
     client1.open_and_assign(&client2, Amount::ONE).await?;
 
     let tmp_dir = tempfile::tempdir()?;
@@ -2783,8 +4435,7 @@ async fn test_end_to_end_publish_data_blob_in_cli(config: impl LineraNetConfig) 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_faucet(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -2794,21 +4445,19 @@ async fn test_end_to_end_faucet(config: impl LineraNetConfig) -> Result<()> {
     let (mut net, client1) = config.instantiate().await?;
 
     let client2 = net.make_client().await;
-    client2.wallet_init(&[], FaucetOption::None).await?;
+    client2.wallet_init(None).await?;
 
     let chain1 = client1.load_wallet()?.default_chain().unwrap();
     let balance1 = client1.local_balance(Account::chain(chain1)).await?;
 
     // Generate keys for client 2.
-    let client2_key = client2.keygen().await?;
+    let owner2 = client2.keygen().await?;
 
     let mut faucet_service = client1
-        .run_faucet(None, chain1, Amount::from_tokens(2))
+        .run_faucet(None, Some(chain1), Amount::from_tokens(2))
         .await?;
     let faucet = faucet_service.instance();
-    let outcome = faucet.claim(&client2_key).await?;
-    let chain2 = outcome.chain_id;
-    let message_id = outcome.message_id;
+    let chain2 = faucet.claim(&owner2).await?.id();
 
     // Test version info.
     let info = faucet.version_info().await?;
@@ -2816,10 +4465,16 @@ async fn test_end_to_end_faucet(config: impl LineraNetConfig) -> Result<()> {
 
     // Use the faucet directly to initialize client 3.
     let client3 = net.make_client().await;
-    let outcome = client3
-        .wallet_init(&[], FaucetOption::NewChain(&faucet))
-        .await?;
-    let chain3 = outcome.unwrap().chain_id;
+    client3.wallet_init(None).await?;
+    let chain_id = client3.request_chain(&faucet, false).await?.0;
+    assert_eq!(chain_id, client3.load_wallet()?.default_chain().unwrap());
+
+    let chain_id = client3.request_chain(&faucet, false).await?.0;
+    assert!(chain_id != client3.load_wallet()?.default_chain().unwrap());
+    client3.forget_chain(chain_id).await?;
+    client3.follow_chain(chain_id, false).await?;
+
+    let chain3 = client3.request_chain(&faucet, true).await?.0;
     assert_eq!(chain3, client3.load_wallet()?.default_chain().unwrap());
 
     faucet_service.ensure_is_running()?;
@@ -2828,11 +4483,11 @@ async fn test_end_to_end_faucet(config: impl LineraNetConfig) -> Result<()> {
     // Chain 1 should have transferred four tokens, two to each child.
     client1.sync(chain1).await?;
     let faucet_balance = client1.query_balance(Account::chain(chain1)).await?;
-    assert!(faucet_balance <= balance1 - Amount::from_tokens(4));
-    assert!(faucet_balance > balance1 - Amount::from_tokens(5));
+    assert!(faucet_balance <= balance1 - Amount::from_tokens(8));
+    assert!(faucet_balance > balance1 - Amount::from_tokens(9));
 
     // Assign chain2 to client2_key.
-    assert_eq!(chain2, client2.assign(client2_key, message_id).await?);
+    client2.assign(owner2, chain2).await?;
 
     // Clients 2 and 3 should have the tokens, and own the chain.
     client2.sync(chain2).await?;
@@ -2856,12 +4511,11 @@ async fn test_end_to_end_faucet(config: impl LineraNetConfig) -> Result<()> {
     Ok(())
 }
 
-/// Tests creating a new wallet using a Faucet that has already created a lot of microchains.
+/// Tests creating a new wallet using a faucet that has already created a lot of microchains.
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 #[ignore = "This test takes a long time to run"]
 async fn test_end_to_end_faucet_with_long_chains(config: impl LineraNetConfig) -> Result<()> {
@@ -2876,35 +4530,57 @@ async fn test_end_to_end_faucet_with_long_chains(config: impl LineraNetConfig) -
 
     // Use the faucet directly to initialize many chains
     for _ in 0..chain_count {
-        let (_, new_chain_id) = faucet_client
+        let (new_chain_id, _) = faucet_client
             .open_chain(faucet_chain, None, Amount::ONE)
             .await?;
         faucet_client.forget_chain(new_chain_id).await?;
     }
 
-    let amount = Amount::ONE;
-    let mut faucet_service = faucet_client.run_faucet(None, faucet_chain, amount).await?;
+    let new_chain_init_balance = Amount::ONE;
+    let mut faucet_service = faucet_client
+        .run_faucet(None, Some(faucet_chain), new_chain_init_balance)
+        .await?;
     let faucet = faucet_service.instance();
 
     // Create a new wallet using the faucet
     let client = net.make_client().await;
-    let outcome = client
-        .wallet_init(&[], FaucetOption::NewChain(&faucet))
-        .await?;
-
-    let chain = outcome.unwrap().chain_id;
+    client.wallet_init(Some(&faucet)).await?;
+    let chain = client.request_chain(&faucet, true).await?.0;
     assert_eq!(chain, client.load_wallet()?.default_chain().unwrap());
 
-    let initial_balance = client.query_balance(Account::chain(chain)).await?;
-    let fees_paid = amount - initial_balance;
-    assert!(initial_balance > Amount::ZERO);
+    let init_source_balance = client.query_balance(Account::chain(chain)).await?;
+    assert_eq!(
+        init_source_balance, new_chain_init_balance,
+        "Chain balance should be equal to the faucet amount"
+    );
 
+    let transfer_amount = Amount::from_millis(1);
     client
-        .transfer(initial_balance - fees_paid, chain, faucet_chain)
+        .transfer(transfer_amount, chain, faucet_chain)
         .await?;
-
     let final_balance = client.query_balance(Account::chain(chain)).await?;
-    assert_eq!(final_balance, Amount::ZERO);
+
+    let transfer_fee = init_source_balance - final_balance - transfer_amount;
+    assert!(
+        transfer_fee > Amount::ZERO,
+        "Transfer fee should be greater than zero"
+    );
+
+    assert!(
+        final_balance < init_source_balance - transfer_amount,
+        "Chain balance should decrease by transfer amount plus fees"
+    );
+
+    // This is how much we can transfer to zeroize the account and still pay for fees.
+    let amount = final_balance - transfer_fee;
+    client.transfer(amount, chain, faucet_chain).await?;
+
+    let chain_balance = client.query_balance(Account::chain(chain)).await?;
+    assert_eq!(
+        chain_balance,
+        Amount::ZERO,
+        "Chain balance should be zero after transfer"
+    );
 
     faucet_service.ensure_is_running()?;
     faucet_service.terminate().await?;
@@ -2915,12 +4591,98 @@ async fn test_end_to_end_faucet_with_long_chains(config: impl LineraNetConfig) -
     Ok(())
 }
 
-#[cfg(feature = "benchmark")]
+/// Tests faucet batch processing with multiple concurrent chain creation requests
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_end_to_end_faucet_batch_processing(config: impl LineraNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client1) = config.instantiate().await?;
+
+    let chain1 = client1.load_wallet()?.default_chain().unwrap();
+    let balance1 = client1.local_balance(Account::chain(chain1)).await?;
+
+    // Start faucet with small batch size for testing
+    let mut faucet_service = client1
+        .run_faucet(None, Some(chain1), Amount::from_tokens(2))
+        .await?;
+    let faucet = faucet_service.instance();
+
+    // Test batch processing by creating multiple concurrent requests
+    const NUM_REQUESTS: usize = 20;
+    let mut handles = Vec::new();
+
+    for i in 0..NUM_REQUESTS {
+        let faucet_clone = faucet.clone();
+        handles.push(async move {
+            let owner = AccountOwner::from(
+                AccountSecretKey::Secp256k1(Secp256k1SecretKey::generate()).public(),
+            );
+            tracing::info!("Request {} claiming chain for owner: {}", i, owner);
+            faucet_clone.claim(&owner).await
+        });
+    }
+
+    // Wait for all requests to complete
+    let chain_descriptions = future::try_join_all(handles).await?;
+
+    // Verify all chains were created successfully
+    assert_eq!(chain_descriptions.len(), NUM_REQUESTS);
+
+    // Verify all chains are unique
+    let mut chain_ids = std::collections::HashSet::new();
+    for desc in &chain_descriptions {
+        assert!(
+            chain_ids.insert(desc.id()),
+            "Duplicate chain ID: {}",
+            desc.id()
+        );
+    }
+
+    // Test duplicate request handling - should return existing chain
+    let owner =
+        AccountOwner::from(AccountSecretKey::Secp256k1(Secp256k1SecretKey::generate()).public());
+    let first_claim = faucet.claim(&owner).await?;
+    let second_claim = faucet.claim(&owner).await?;
+    assert_eq!(
+        first_claim.id(),
+        second_claim.id(),
+        "Duplicate request should return same chain"
+    );
+
+    faucet_service.ensure_is_running()?;
+    faucet_service.terminate().await?;
+
+    // Verify balance was decremented appropriately (NUM_REQUESTS * 2 tokens + fees)
+    let final_balance = client1.query_balance(Account::chain(chain1)).await?;
+    let expected_transfer = Amount::from_tokens((NUM_REQUESTS * 2) as u128);
+    assert!(final_balance <= balance1 - expected_transfer);
+
+    // Verify that fewer than NUM_REQUESTS blocks were created, i.e. some of them were batched.
+    let port = get_node_port().await;
+    let service = client1.run_node_service(port, ProcessInbox::Skip).await?;
+    let query =
+        format!("query {{ chain(chainId:\"{chain1}\") {{ tipState {{ nextBlockHeight }} }} }}");
+    let response = service.query_node(query).await?;
+    let height = response["chain"]["tipState"]["nextBlockHeight"]
+        .as_u64()
+        .unwrap();
+    assert!(height < NUM_REQUESTS as u64);
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_fungible_client_benchmark(config: impl LineraNetConfig) -> Result<()> {
     use linera_base::command::CommandExt;
@@ -2934,10 +4696,11 @@ async fn test_end_to_end_fungible_client_benchmark(config: impl LineraNetConfig)
 
     let chain1 = client1.load_wallet()?.default_chain().unwrap();
 
-    let mut faucet_service = client1.run_faucet(None, chain1, Amount::ONE).await?;
+    let mut faucet_service = client1.run_faucet(None, Some(chain1), Amount::ONE).await?;
     let faucet = faucet_service.instance();
 
-    let path = resolve_binary("linera-benchmark", env!("CARGO_PKG_NAME")).await?;
+    let path =
+        linera_base::command::resolve_binary("linera-benchmark", env!("CARGO_PKG_NAME")).await?;
     // The benchmark looks for examples/fungible, so it needs to run in the project root.
     let current_dir = std::env::current_exe()?;
     let dir = current_dir.ancestors().nth(4).unwrap();
@@ -2964,99 +4727,74 @@ async fn test_end_to_end_fungible_client_benchmark(config: impl LineraNetConfig)
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_listen_for_new_rounds(config: impl LineraNetConfig) -> Result<()> {
-    use std::{
-        sync::{Arc, Barrier},
-        thread,
-    };
-
-    let _guard = INTEGRATION_TEST_GUARD.lock().await;
-    tracing::info!("Starting test {}", test_name!());
-
-    use tokio::task::JoinHandle;
-
-    // Create runner and two clients.
-    let (mut net, client1) = config.instantiate().await?;
-    let client2 = net.make_client().await;
-    client2.wallet_init(&[], FaucetOption::None).await?;
-    let chain1 = *client1.load_wallet()?.chain_ids().first().unwrap();
-
-    // Open a chain owned by both clients, with only single-leader rounds.
-    let client1_key = client1.keygen().await?;
-    let client2_key = client2.keygen().await?;
-    let (message_id, chain2) = client1
-        .open_multi_owner_chain(
-            chain1,
-            vec![client1_key, client2_key],
-            vec![100, 100],
-            0,
-            Amount::from_tokens(9),
-            u64::MAX,
-        )
-        .await?;
-    client1.assign(client1_key, message_id).await?;
-    client2.assign(client2_key, message_id).await?;
-    client2.sync(chain2).await?;
-
-    let (tx, mut rx) = mpsc::channel(8);
-    let drop_barrier = Arc::new(Barrier::new(3));
-    let handle1 = tokio::spawn(run_client(
-        drop_barrier.clone(),
-        client1,
-        tx.clone(),
-        chain2,
-        chain1,
-    ));
-    let handle2 = tokio::spawn(run_client(
-        drop_barrier.clone(),
-        client2,
-        tx,
-        chain2,
-        chain1,
-    ));
-
     /// Runs the `client` in a task, so that it can race to produce blocks transferring tokens.
     ///
-    /// Stops when transferring fails or the `notifier` channel is closed. When exiting, it will
-    /// drop the client in a separate thread so that the synchronous `Drop` implementation
-    /// can close the chains without blocking the asynchronous worker thread, which might be
-    /// shared with the other client's task. If the asynchronous thread is blocked, the
-    /// other client might have the round but not be able to execute and propose a block,
-    /// deadlocking the test.
+    /// Stops when transferring fails or the `notifier` channel is closed.
+    ///
+    /// Drops the client wrapper in a separate thread: Only one of the clients can close the chain,
+    /// and the `Drop` implementation blocks the thread until the command returns.
     async fn run_client(
-        drop_barrier: Arc<Barrier>,
         client: ClientWrapper,
         mut notifier: mpsc::Sender<()>,
         source: ChainId,
         target: ChainId,
-    ) -> Result<JoinHandle<Result<()>>> {
-        let result = async {
-            loop {
-                client.transfer(Amount::ONE, source, target).await?;
-                notifier.send(()).await?;
-            }
+    ) {
+        let duration = Duration::from_secs(60);
+        while tokio::time::timeout(
+            duration,
+            client.transfer_with_silent_logs(Amount::ONE, source, target),
+        )
+        .await
+        .expect("Transfer timed out")
+        .is_ok()
+        {
+            notifier.try_send(()).unwrap();
         }
-        .await;
-        thread::spawn(move || {
-            drop(client);
-            drop_barrier.wait();
-        });
-        result
+        tokio::task::spawn_blocking(move || drop(client))
+            .await
+            .unwrap();
     }
 
-    for _ in 0..8 {
-        let () = rx.next().await.unwrap();
-    }
-    drop(rx);
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
 
-    let (result1, result2) = futures::join!(handle1, handle2);
-    assert!(result1?.is_err());
-    assert!(result2?.is_err());
+    // Create runner and two clients.
+    let (mut net, client1) = config.instantiate().await?;
+    let client2 = net.make_client().await;
+    client2.wallet_init(None).await?;
+    let chain1 = *client1.load_wallet()?.owned_chain_ids().first().unwrap();
 
-    drop_barrier.wait();
+    // Open a chain owned by both clients, with only single-leader rounds that don't time out:
+    // The first round should always succeed, because both leaders are active.
+    let owner1 = client1.keygen().await?;
+    let owner2 = client2.keygen().await?;
+    let chain2 = client1
+        .open_multi_owner_chain(
+            chain1,
+            vec![owner1, owner2],
+            vec![100, 100],            // Both owners have equal weight.
+            0,                         // No multi-leader rounds.
+            Amount::from_millis(8900), // Only 8 transfers can be made.
+            u64::MAX,                  // 585 million years
+        )
+        .await?;
+    client1.assign(owner1, chain2).await?;
+    client2.assign(owner2, chain2).await?;
+    client2.sync(chain2).await?;
+
+    // Both clients make transfers from chain 2 to chain 1 in a loop. We use a channel with
+    // capacity 8, the number of expected transfers.
+    let (tx, rx) = mpsc::channel(8);
+    futures::join!(
+        run_client(client1, tx.clone(), chain2, chain1),
+        run_client(client2, tx, chain2, chain1)
+    );
+    // 8 transfers succeeded, the ninth failed because the chain ran out of tokens.
+    assert_eq!(rx.count().await, 8);
+
     net.ensure_is_running().await?;
     net.terminate().await?;
 
@@ -3079,8 +4817,7 @@ async fn test_end_to_end_listen_for_new_rounds(config: impl LineraNetConfig) -> 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_repeated_transfers(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -3093,7 +4830,7 @@ async fn test_end_to_end_repeated_transfers(config: impl LineraNetConfig) -> Res
     let (mut net, client1) = config.instantiate().await?;
     let chain_id1 = client1.load_wallet()?.default_chain().unwrap();
     let client2 = net.make_client().await;
-    client2.wallet_init(&[], FaucetOption::None).await?;
+    client2.wallet_init(None).await?;
     let chain_id2 = client1.open_and_assign(&client2, Amount::ONE).await?;
     let port1 = get_node_port().await;
     let port2 = get_node_port().await;
@@ -3101,10 +4838,8 @@ async fn test_end_to_end_repeated_transfers(config: impl LineraNetConfig) -> Res
         .run_node_service(port2, ProcessInbox::Automatic)
         .await?;
 
-    // Make sure all incoming messages are processed, and get both chains' heights.
     let mut next_height1 = {
         let node_service1 = client1.run_node_service(port1, ProcessInbox::Skip).await?;
-        node_service1.process_inbox(&chain_id1).await?;
         let mut chain = node_service1
             .query_node(&format!(
                 "query {{ chain(chainId: \"{chain_id1}\") {{ tipState {{ nextBlockHeight }} }} }}"
@@ -3113,7 +4848,6 @@ async fn test_end_to_end_repeated_transfers(config: impl LineraNetConfig) -> Res
         serde_json::from_value::<BlockHeight>(chain["chain"]["tipState"]["nextBlockHeight"].take())?
     };
     let mut next_height2 = {
-        node_service2.process_inbox(&chain_id2).await?;
         let mut chain = node_service2
             .query_node(&format!(
                 "query {{ chain(chainId: \"{chain_id2}\") {{ tipState {{ nextBlockHeight }} }} }}"
@@ -3159,8 +4893,7 @@ async fn test_end_to_end_repeated_transfers(config: impl LineraNetConfig) -> Res
             match reason {
                 Reason::NewIncomingBundle { height, origin } => {
                     assert_eq!(height, next_height1);
-                    assert_eq!(origin.sender, chain_id1);
-                    assert_eq!(origin.medium, Medium::Direct);
+                    assert_eq!(origin, chain_id1);
                     assert!(
                         !got_message,
                         "Duplicate message notification about transfer #{i}"
@@ -3183,27 +4916,37 @@ async fn test_end_to_end_repeated_transfers(config: impl LineraNetConfig) -> Res
                     }
                     break hash;
                 }
-                reason @ Reason::NewRound { .. } => {
+                reason @ Reason::NewRound { .. } | reason @ Reason::NewEvents { .. } => {
                     panic!("Unexpected notification about transfer #{i} {reason:?}")
+                }
+                Reason::BlockExecuted { .. } => {
+                    // Ignored
                 }
             }
         };
 
         // Verify that the created block received the transfer message from chain 1.
-        let mut block2 = node_service2
+        let block2 = node_service2
             .query_node(&format!(
                 "query {{ block(hash: \"{hash2}\", chainId: \"{chain_id2}\") {{ \
-                    value {{ executedBlock {{ block {{ incomingBundles {{ \
-                        origin bundle {{ height }} \
-                    }} }} }} }} \
+                    block {{ body {{ transactionMetadata {{ \
+                        transactionType incomingBundle {{ origin bundle {{ height }} }} \
+                    }} }} }} \
                 }} }}"
             ))
             .await?;
-        let mut bundle =
-            block2["block"]["value"]["executedBlock"]["block"]["incomingBundles"][0].take();
-        let origin = serde_json::from_value::<Origin>(bundle["origin"].take())?;
-        assert_eq!(origin.sender, chain_id1);
-        assert_eq!(origin.medium, Medium::Direct);
+        // Find the transaction metadata entry that contains an incoming bundle
+        let transaction_metadata = &block2["block"]["block"]["body"]["transactionMetadata"];
+        let mut bundle = None;
+        for metadata in transaction_metadata.as_array().unwrap() {
+            if metadata["transactionType"] == "ReceiveMessages" {
+                bundle = Some(metadata["incomingBundle"].clone());
+                break;
+            }
+        }
+        let mut bundle = bundle.expect("No ReceiveMessages transaction found");
+        let origin = serde_json::from_value::<ChainId>(bundle["origin"].take())?;
+        assert_eq!(origin, chain_id1);
         let sender_height =
             serde_json::from_value::<BlockHeight>(bundle["bundle"]["height"].take())?;
         assert_eq!(sender_height + BlockHeight(1), next_height1);

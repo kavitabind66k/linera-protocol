@@ -11,6 +11,9 @@ license.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[lints]
+workspace = true
+
 [package.metadata.docs.rs]
 features = ["ethereum"]
 
@@ -18,6 +21,7 @@ features = ["ethereum"]
 ethereum = []
 
 [dependencies]
+alloy-primitives.workspace = true
 anyhow.workspace = true
 async-lock.workspace = true
 async-trait.workspace = true
@@ -29,13 +33,20 @@ serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-alloy = { workspace = true, default-features = false, features = [ "rpc-types-eth", "provider-http", "json-rpc", "node-bindings", "network", "signers", "contract" ] }
-alloy-signer-local = { workspace = true }
+alloy = { workspace = true, default-features = false, features = [
+    "rpc-types-eth",
+    "json-rpc",
+    "node-bindings",
+    "signer-local",
+    "contract",
+] }
 url.workspace = true
 tokio = { workspace = true, features = ["full"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-alloy = { workspace = true, default-features = false, features = [ "rpc-types-eth" ] }
+alloy = { workspace = true, default-features = false, features = [
+    "rpc-types-eth",
+] }
 
 [build-dependencies]
 cfg_aliases.workspace = true

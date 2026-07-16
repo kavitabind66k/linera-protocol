@@ -3,11 +3,13 @@
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::BTreeMap,
     env,
     marker::PhantomData,
     mem,
     path::{Path, PathBuf},
+    pin::Pin,
+    process::Stdio,
     str::FromStr,
     sync,
     time::Duration,
@@ -17,30 +19,46 @@ use anyhow::{bail, ensure, Context, Result};
 use async_graphql::InputType;
 use async_tungstenite::tungstenite::{client::IntoClientRequest as _, http::HeaderValue};
 use futures::{SinkExt as _, Stream, StreamExt as _, TryStreamExt as _};
+use heck::ToKebabCase;
 use linera_base::{
     abi::ContractAbi,
     command::{resolve_binary, CommandExt},
-    crypto::{CryptoHash, PublicKey},
-    data_types::{Amount, Bytecode},
-    identifiers::{Account, ApplicationId, BytecodeId, ChainId, MessageId, Owner},
+    crypto::{CryptoHash, InMemorySigner},
+    data_types::{Amount, BlockHeight, Bytecode, Epoch},
+    identifiers::{
+        Account, AccountOwner, ApplicationId, ChainId, IndexAndEvent, ModuleId, StreamId,
+    },
+    vm::VmRuntime,
 };
-use linera_client::{config::GenesisConfig, wallet::Wallet};
+use linera_client::client_options::ResourceControlPolicyConfig;
 use linera_core::worker::Notification;
-use linera_execution::{committee::ValidatorName, system::SystemChannel, ResourceControlPolicy};
-use linera_version::VersionInfo;
+use linera_execution::committee::Committee;
+use linera_faucet_client::Faucet;
 use serde::{de::DeserializeOwned, ser::Serialize};
+use serde_command_opts::to_args;
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use tokio::process::{Child, Command};
-use tracing::{error, info, warn};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::{Child, Command},
+    sync::oneshot,
+    task::JoinHandle,
+};
+#[cfg(with_testing)]
+use {
+    futures::FutureExt as _,
+    linera_core::worker::Reason,
+    std::{collections::BTreeSet, future::Future},
+};
 
 use crate::{
+    cli::command::BenchmarkCommand,
     cli_wrappers::{
         local_net::{PathProvider, ProcessInbox},
         Network,
     },
-    faucet::ClaimOutcome,
     util::{self, ChildExt},
+    wallet::Wallet,
 };
 
 /// The name of the environment variable that allows specifying additional arguments to be passed
@@ -60,10 +78,12 @@ pub struct ClientWrapper {
     testing_prng_seed: Option<u64>,
     storage: String,
     wallet: String,
+    keystore: String,
     max_pending_message_bundles: usize,
     network: Network,
     pub path_provider: PathProvider,
     on_drop: OnClientDrop,
+    extra_args: Vec<String>,
 }
 
 /// Action to perform when the [`ClientWrapper`] is dropped.
@@ -83,21 +103,42 @@ impl ClientWrapper {
         id: usize,
         on_drop: OnClientDrop,
     ) -> Self {
+        Self::new_with_extra_args(
+            path_provider,
+            network,
+            testing_prng_seed,
+            id,
+            on_drop,
+            vec!["--wait-for-outgoing-messages".to_string()],
+        )
+    }
+
+    pub fn new_with_extra_args(
+        path_provider: PathProvider,
+        network: Network,
+        testing_prng_seed: Option<u64>,
+        id: usize,
+        on_drop: OnClientDrop,
+        extra_args: Vec<String>,
+    ) -> Self {
         let storage = format!(
             "rocksdb:{}/client_{}.db",
             path_provider.path().display(),
             id
         );
         let wallet = format!("wallet_{}.json", id);
+        let keystore = format!("keystore_{}.json", id);
         Self {
             binary_path: sync::Mutex::new(None),
             testing_prng_seed,
             storage,
             wallet,
+            keystore,
             max_pending_message_bundles: 10_000,
             network,
             path_provider,
             on_drop,
+            extra_args,
         }
     }
 
@@ -156,34 +197,72 @@ impl ClientWrapper {
         Ok(())
     }
 
-    async fn command(&self) -> Result<Command> {
+    async fn command_with_envs_and_arguments(
+        &self,
+        envs: &[(&str, &str)],
+        arguments: impl IntoIterator<Item = Cow<'_, str>>,
+    ) -> Result<Command> {
         let mut command = self.command_binary().await?;
-        command.current_dir(self.path_provider.path()).env(
-            "RUST_LOG",
-            std::env::var("RUST_LOG").unwrap_or(String::from("linera=debug")),
-        );
-        for argument in self.command_arguments() {
+        command.current_dir(self.path_provider.path());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        for argument in arguments {
             command.arg(&*argument);
         }
         Ok(command)
     }
 
-    /// Returns an iterator over the arguments that should be added to all command invocations.
-    fn command_arguments(&self) -> impl Iterator<Item = Cow<'_, str>> + '_ {
+    async fn command_with_envs(&self, envs: &[(&str, &str)]) -> Result<Command> {
+        self.command_with_envs_and_arguments(envs, self.command_arguments())
+            .await
+    }
+
+    async fn command_with_arguments(
+        &self,
+        arguments: impl IntoIterator<Item = Cow<'_, str>>,
+    ) -> Result<Command> {
+        self.command_with_envs_and_arguments(
+            &[(
+                "RUST_LOG",
+                &std::env::var("RUST_LOG").unwrap_or(String::from("linera=debug")),
+            )],
+            arguments,
+        )
+        .await
+    }
+
+    async fn command(&self) -> Result<Command> {
+        self.command_with_envs(&[(
+            "RUST_LOG",
+            &std::env::var("RUST_LOG").unwrap_or(String::from("linera=debug")),
+        )])
+        .await
+    }
+
+    fn required_command_arguments(&self) -> impl Iterator<Item = Cow<'_, str>> + '_ {
         [
             "--wallet".into(),
             self.wallet.as_str().into(),
+            "--keystore".into(),
+            self.keystore.as_str().into(),
             "--storage".into(),
             self.storage.as_str().into(),
-            "--max-pending-message-bundles".into(),
-            self.max_pending_message_bundles.to_string().into(),
             "--send-timeout-ms".into(),
             "500000".into(),
             "--recv-timeout-ms".into(),
             "500000".into(),
-            "--wait-for-outgoing-messages".into(),
         ]
         .into_iter()
+        .chain(self.extra_args.iter().map(|s| s.as_str().into()))
+    }
+
+    /// Returns an iterator over the arguments that should be added to all command invocations.
+    fn command_arguments(&self) -> impl Iterator<Item = Cow<'_, str>> + '_ {
+        self.required_command_arguments().chain([
+            "--max-pending-message-bundles".into(),
+            self.max_pending_message_bundles.to_string().into(),
+        ])
     }
 
     /// Returns the [`Command`] instance configured to run the appropriate binary.
@@ -232,28 +311,9 @@ impl ClientWrapper {
         &self,
         num_other_initial_chains: u32,
         initial_funding: Amount,
-        policy: ResourceControlPolicy,
+        policy_config: ResourceControlPolicyConfig,
+        http_allow_list: Option<Vec<String>>,
     ) -> Result<()> {
-        let ResourceControlPolicy {
-            block,
-            fuel_unit,
-            read_operation,
-            write_operation,
-            byte_read,
-            byte_written,
-            byte_stored,
-            operation,
-            operation_byte,
-            message,
-            message_byte,
-            maximum_fuel_per_block,
-            maximum_executed_block_size,
-            maximum_blob_size,
-            maximum_bytecode_size,
-            maximum_block_proposal_size,
-            maximum_bytes_read_per_block,
-            maximum_bytes_written_per_block,
-        } = policy;
         let mut command = self.command().await?;
         command
             .args([
@@ -263,42 +323,15 @@ impl ClientWrapper {
             .args(["--initial-funding", &initial_funding.to_string()])
             .args(["--committee", "committee.json"])
             .args(["--genesis", "genesis.json"])
-            .args(["--block-price", &block.to_string()])
-            .args(["--fuel-unit-price", &fuel_unit.to_string()])
-            .args(["--read-operation-price", &read_operation.to_string()])
-            .args(["--byte-read-price", &byte_read.to_string()])
-            .args(["--byte-written-price", &byte_written.to_string()])
-            .args(["--byte-stored-price", &byte_stored.to_string()])
-            .args(["--message-byte-price", &message_byte.to_string()])
-            .args(["--write-operation-price", &write_operation.to_string()])
-            .args(["--operation-price", &operation.to_string()])
-            .args(["--operation-byte-price", &operation_byte.to_string()])
-            .args(["--message-price", &message.to_string()])
             .args([
-                "--maximum-fuel-per-block",
-                &maximum_fuel_per_block.to_string(),
-            ])
-            .args([
-                "--maximum-executed-block-size",
-                &maximum_executed_block_size.to_string(),
-            ])
-            .args(["--maximum-blob-size", &maximum_blob_size.to_string()])
-            .args([
-                "--maximum-bytecode-size",
-                &maximum_bytecode_size.to_string(),
-            ])
-            .args([
-                "--maximum-block-proposal-size",
-                &maximum_block_proposal_size.to_string(),
-            ])
-            .args([
-                "--maximum-bytes-read-per-block",
-                &maximum_bytes_read_per_block.to_string(),
-            ])
-            .args([
-                "--maximum-bytes-written-per-block",
-                &maximum_bytes_written_per_block.to_string(),
+                "--policy-config",
+                &policy_config.to_string().to_kebab_case(),
             ]);
+        if let Some(allow_list) = http_allow_list {
+            command
+                .arg("--http-request-allow-list")
+                .arg(allow_list.join(","));
+        }
         if let Some(seed) = self.testing_prng_seed {
             command.arg("--testing-prng-seed").arg(seed.to_string());
         }
@@ -306,52 +339,42 @@ impl ClientWrapper {
         Ok(())
     }
 
-    /// Runs `linera wallet init`.
-    pub async fn wallet_init(
-        &self,
-        chain_ids: &[ChainId],
-        faucet: FaucetOption<'_>,
-    ) -> Result<Option<ClaimOutcome>> {
+    /// Runs `linera wallet init`. The genesis config is read from `genesis.json`, or from the
+    /// faucet if provided.
+    pub async fn wallet_init(&self, faucet: Option<&'_ Faucet>) -> Result<()> {
         let mut command = self.command().await?;
         command.args(["wallet", "init"]);
         match faucet {
-            FaucetOption::None => {
-                command.args(["--genesis", "genesis.json"]);
-            }
-            FaucetOption::GenesisOnly(faucet) => {
-                command.args(["--faucet", faucet.url()]);
-            }
-            FaucetOption::NewChain(faucet) => {
-                command.args(["--with-new-chain", "--faucet", faucet.url()]);
-            }
-        }
+            None => command.args(["--genesis", "genesis.json"]),
+            Some(faucet) => command.args(["--faucet", faucet.url()]),
+        };
         if let Some(seed) = self.testing_prng_seed {
             command.arg("--testing-prng-seed").arg(seed.to_string());
         }
-        if !chain_ids.is_empty() {
-            let ids = chain_ids.iter().map(ChainId::to_string);
-            command.arg("--with-other-chains").args(ids);
+        command.spawn_and_wait_for_stdout().await?;
+        Ok(())
+    }
+
+    /// Runs `linera wallet request-chain`.
+    pub async fn request_chain(
+        &self,
+        faucet: &Faucet,
+        set_default: bool,
+    ) -> Result<(ChainId, AccountOwner)> {
+        let mut command = self.command().await?;
+        command.args(["wallet", "request-chain", "--faucet", faucet.url()]);
+        if set_default {
+            command.arg("--set-default");
         }
         let stdout = command.spawn_and_wait_for_stdout().await?;
-        if matches!(faucet, FaucetOption::NewChain(_)) {
-            let mut lines = stdout.split_whitespace();
-            let chain_id_str = lines.next().context("missing chain ID")?;
-            let message_id_str = lines.next().context("missing message ID")?;
-            let certificate_hash_str = lines.next().context("missing certificate hash")?;
-            let outcome = ClaimOutcome {
-                chain_id: chain_id_str.parse().context("invalid chain ID")?,
-                message_id: message_id_str.parse().context("invalid message ID")?,
-                certificate_hash: certificate_hash_str
-                    .parse()
-                    .context("invalid certificate hash")?,
-            };
-            Ok(Some(outcome))
-        } else {
-            Ok(None)
-        }
+        let mut lines = stdout.split_whitespace();
+        let chain_id: ChainId = lines.next().context("missing chain ID")?.parse()?;
+        let owner = lines.next().context("missing chain owner")?.parse()?;
+        Ok((chain_id, owner))
     }
 
     /// Runs `linera wallet publish-and-create`.
+    #[expect(clippy::too_many_arguments)]
     pub async fn publish_and_create<
         A: ContractAbi,
         Parameters: Serialize,
@@ -360,6 +383,7 @@ impl ClientWrapper {
         &self,
         contract: PathBuf,
         service: PathBuf,
+        vm_runtime: VmRuntime,
         parameters: &Parameters,
         argument: &InstantiationArgument,
         required_application_ids: &[ApplicationId],
@@ -368,9 +392,11 @@ impl ClientWrapper {
         let json_parameters = serde_json::to_string(parameters)?;
         let json_argument = serde_json::to_string(argument)?;
         let mut command = self.command().await?;
+        let vm_runtime = format!("{}", vm_runtime);
         command
             .arg("publish-and-create")
             .args([contract, service])
+            .args(["--vm-runtime", &vm_runtime.to_lowercase()])
             .args(publisher.into().iter().map(ChainId::to_string))
             .args(["--json-parameters", &json_parameters])
             .args(["--json-argument", &json_argument]);
@@ -386,23 +412,25 @@ impl ClientWrapper {
         Ok(stdout.trim().parse::<ApplicationId>()?.with_abi())
     }
 
-    /// Runs `linera publish-bytecode`.
-    pub async fn publish_bytecode<Abi, Parameters, InstantiationArgument>(
+    /// Runs `linera publish-module`.
+    pub async fn publish_module<Abi, Parameters, InstantiationArgument>(
         &self,
         contract: PathBuf,
         service: PathBuf,
+        vm_runtime: VmRuntime,
         publisher: impl Into<Option<ChainId>>,
-    ) -> Result<BytecodeId<Abi, Parameters, InstantiationArgument>> {
+    ) -> Result<ModuleId<Abi, Parameters, InstantiationArgument>> {
         let stdout = self
             .command()
             .await?
-            .arg("publish-bytecode")
+            .arg("publish-module")
             .args([contract, service])
+            .args(["--vm-runtime", &format!("{}", vm_runtime).to_lowercase()])
             .args(publisher.into().iter().map(ChainId::to_string))
             .spawn_and_wait_for_stdout()
             .await?;
-        let bytecode_id: BytecodeId = stdout.trim().parse()?;
-        Ok(bytecode_id.with_abi())
+        let module_id: ModuleId = stdout.trim().parse()?;
+        Ok(module_id.with_abi())
     }
 
     /// Runs `linera create-application`.
@@ -412,7 +440,7 @@ impl ClientWrapper {
         InstantiationArgument: Serialize,
     >(
         &self,
-        bytecode_id: &BytecodeId<Abi, Parameters, InstantiationArgument>,
+        module_id: &ModuleId<Abi, Parameters, InstantiationArgument>,
         parameters: &Parameters,
         argument: &InstantiationArgument,
         required_application_ids: &[ApplicationId],
@@ -423,7 +451,7 @@ impl ClientWrapper {
         let mut command = self.command().await?;
         command
             .arg("create-application")
-            .arg(bytecode_id.forget_abi().to_string())
+            .arg(module_id.forget_abi().to_string())
             .args(["--json-parameters", &json_parameters])
             .args(["--json-argument", &json_argument])
             .args(creator.into().iter().map(ChainId::to_string));
@@ -439,30 +467,23 @@ impl ClientWrapper {
         Ok(stdout.trim().parse::<ApplicationId>()?.with_abi())
     }
 
-    /// Runs `linera request-application`
-    pub async fn request_application(
-        &self,
-        application_id: ApplicationId,
-        requester_chain_id: ChainId,
-        target_chain_id: Option<ChainId>,
-    ) -> Result<BytecodeId> {
-        let mut command = self.command().await?;
-        command
-            .arg("request-application")
-            .arg(application_id.to_string())
-            .args(["--requester-chain-id", &requester_chain_id.to_string()]);
-        if let Some(target_chain_id) = target_chain_id {
-            command.args(["--target-chain-id", &target_chain_id.to_string()]);
-        }
-        let stdout = command.spawn_and_wait_for_stdout().await?;
-        Ok(stdout.trim().parse()?)
-    }
-
     /// Runs `linera service`.
     pub async fn run_node_service(
         &self,
         port: impl Into<Option<u16>>,
         process_inbox: ProcessInbox,
+    ) -> Result<NodeService> {
+        self.run_node_service_with_options(port, process_inbox, &[], &[])
+            .await
+    }
+
+    /// Runs `linera service` with optional task processor configuration.
+    pub async fn run_node_service_with_options(
+        &self,
+        port: impl Into<Option<u16>>,
+        process_inbox: ProcessInbox,
+        operator_application_ids: &[ApplicationId],
+        operators: &[(String, PathBuf)],
     ) -> Result<NodeService> {
         let port = port.into().unwrap_or(8080);
         let mut command = self.command().await?;
@@ -473,6 +494,12 @@ impl ClientWrapper {
         if let Ok(var) = env::var(CLIENT_SERVICE_ENV) {
             command.args(var.split_whitespace());
         }
+        for app_id in operator_application_ids {
+            command.args(["--operator-application-ids", &app_id.to_string()]);
+        }
+        for (name, path) in operators {
+            command.args(["--operators", &format!("{}={}", name, path.display())]);
+        }
         let child = command
             .args(["--port".to_string(), port.to_string()])
             .spawn_into()?;
@@ -484,33 +511,60 @@ impl ClientWrapper {
                 .send()
                 .await;
             if request.is_ok() {
-                info!("Node service has started");
+                tracing::info!("Node service has started");
                 return Ok(NodeService::new(port, child));
             } else {
-                warn!("Waiting for node service to start");
+                tracing::warn!("Waiting for node service to start");
             }
         }
         bail!("Failed to start node service");
     }
 
-    /// Runs `linera query-validator`
+    /// Runs `linera validator query`
     pub async fn query_validator(&self, address: &str) -> Result<CryptoHash> {
         let mut command = self.command().await?;
-        command.arg("query-validator").arg(address);
+        command.arg("validator").arg("query").arg(address);
         let stdout = command.spawn_and_wait_for_stdout().await?;
+
+        // Parse the genesis config hash from the output.
+        // It's on a line like "Genesis config hash: <hash>"
         let hash = stdout
-            .trim()
-            .parse()
-            .context("error while parsing the result of `linera query-validator`")?;
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Genesis config hash: ")
+                    .and_then(|hash_str| hash_str.trim().parse().ok())
+            })
+            .context("error while parsing the result of `linera validator query`")?;
         Ok(hash)
     }
 
-    /// Runs `linera query-validators`.
+    /// Runs `linera validator list`.
     pub async fn query_validators(&self, chain_id: Option<ChainId>) -> Result<()> {
         let mut command = self.command().await?;
-        command.arg("query-validators");
+        command.arg("validator").arg("list");
         if let Some(chain_id) = chain_id {
-            command.arg(chain_id.to_string());
+            command.args(["--chain-id", &chain_id.to_string()]);
+        }
+        command.spawn_and_wait_for_stdout().await?;
+        Ok(())
+    }
+
+    /// Runs `linera sync-validator`.
+    pub async fn sync_validator(
+        &self,
+        chain_ids: impl IntoIterator<Item = &ChainId>,
+        validator_address: impl Into<String>,
+    ) -> Result<()> {
+        let mut command = self.command().await?;
+        command
+            .arg("validator")
+            .arg("sync")
+            .arg(validator_address.into());
+        let mut chain_ids = chain_ids.into_iter().peekable();
+        if chain_ids.peek().is_some() {
+            command
+                .arg("--chains")
+                .args(chain_ids.map(ChainId::to_string));
         }
         command.spawn_and_wait_for_stdout().await?;
         Ok(())
@@ -520,17 +574,26 @@ impl ClientWrapper {
     pub async fn run_faucet(
         &self,
         port: impl Into<Option<u16>>,
-        chain_id: ChainId,
+        chain_id: Option<ChainId>,
         amount: Amount,
     ) -> Result<FaucetService> {
         let port = port.into().unwrap_or(8080);
+        let temp_dir = tempfile::tempdir()
+            .context("Failed to create temporary directory for faucet storage")?;
+        let storage_path = temp_dir.path().join("faucet_storage.sqlite");
         let mut command = self.command().await?;
-        let child = command
+        let command = command
             .arg("faucet")
-            .arg(chain_id.to_string())
             .args(["--port".to_string(), port.to_string()])
             .args(["--amount".to_string(), amount.to_string()])
-            .spawn_into()?;
+            .args([
+                "--storage-path".to_string(),
+                storage_path.to_string_lossy().to_string(),
+            ]);
+        if let Some(chain_id) = chain_id {
+            command.arg(chain_id.to_string());
+        }
+        let child = command.spawn_into()?;
         let client = reqwest_client();
         for i in 0..10 {
             linera_base::time::timer::sleep(Duration::from_secs(i)).await;
@@ -539,10 +602,10 @@ impl ClientWrapper {
                 .send()
                 .await;
             if request.is_ok() {
-                info!("Faucet has started");
-                return Ok(FaucetService::new(port, child));
+                tracing::info!("Faucet has started");
+                return Ok(FaucetService::new(port, child, temp_dir));
             } else {
-                warn!("Waiting for faucet to start");
+                tracing::debug!("Waiting for faucet to start");
             }
         }
         bail!("Failed to start faucet");
@@ -652,57 +715,155 @@ impl ClientWrapper {
         Ok(())
     }
 
-    /// Runs `linera benchmark`.
-    #[cfg(feature = "benchmark")]
-    pub async fn benchmark(
-        &self,
-        max_in_flight: usize,
-        num_chains: usize,
-        transactions_per_block: usize,
-        fungible_application_id: Option<
-            ApplicationId<linera_sdk::abis::fungible::FungibleTokenAbi>,
-        >,
-    ) -> Result<()> {
-        let mut command = self.command().await?;
+    fn benchmark_command_internal(command: &mut Command, args: BenchmarkCommand) -> Result<()> {
+        let mut formatted_args = to_args(&args)?;
+        let subcommand = formatted_args.remove(0);
+        // The subcommand is followed by the flattened options, which are preceded by "options".
+        // So remove that as well.
+        formatted_args.remove(0);
+        let options = formatted_args
+            .chunks_exact(2)
+            .flat_map(|pair| {
+                let option = format!("--{}", pair[0]);
+                match pair[1].as_str() {
+                    "true" => vec![option],
+                    "false" => vec![],
+                    _ => vec![option, pair[1].clone()],
+                }
+            })
+            .collect::<Vec<_>>();
         command
-            .arg("benchmark")
-            .args(["--max-in-flight", &max_in_flight.to_string()])
-            .args(["--num-chains", &num_chains.to_string()])
             .args([
-                "--transactions-per-block",
-                &transactions_per_block.to_string(),
-            ]);
-        if let Some(application_id) = fungible_application_id {
-            let application_id = application_id.forget_abi().to_string();
-            command.args(["--fungible-application-id", &application_id]);
-        }
+                "--max-pending-message-bundles",
+                &args.transactions_per_block().to_string(),
+            ])
+            .arg("benchmark")
+            .arg(subcommand)
+            .args(options);
+        Ok(())
+    }
+
+    async fn benchmark_command_with_envs(
+        &self,
+        args: BenchmarkCommand,
+        envs: &[(&str, &str)],
+    ) -> Result<Command> {
+        let mut command = self
+            .command_with_envs_and_arguments(envs, self.required_command_arguments())
+            .await?;
+        Self::benchmark_command_internal(&mut command, args)?;
+        Ok(command)
+    }
+
+    async fn benchmark_command(&self, args: BenchmarkCommand) -> Result<Command> {
+        let mut command = self
+            .command_with_arguments(self.required_command_arguments())
+            .await?;
+        Self::benchmark_command_internal(&mut command, args)?;
+        Ok(command)
+    }
+
+    /// Runs `linera benchmark`.
+    pub async fn benchmark(&self, args: BenchmarkCommand) -> Result<()> {
+        let mut command = self.benchmark_command(args).await?;
         command.spawn_and_wait_for_stdout().await?;
         Ok(())
     }
 
-    /// Runs `linera open-chain`.
-    pub async fn open_chain(
+    /// Runs `linera benchmark`, but detached: don't wait for the command to finish, just spawn it
+    /// and return the child process, and the handles to the stdout and stderr.
+    pub async fn benchmark_detached(
+        &self,
+        args: BenchmarkCommand,
+        tx: oneshot::Sender<()>,
+    ) -> Result<(Child, JoinHandle<()>, JoinHandle<()>)> {
+        let mut child = self
+            .benchmark_command_with_envs(args, &[("RUST_LOG", "linera=info")])
+            .await?
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let pid = child.id().expect("failed to get pid");
+        let stdout = child.stdout.take().expect("stdout not open");
+        let stdout_handle = tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                println!("benchmark{{pid={pid}}} {line}");
+            }
+        });
+
+        let stderr = child.stderr.take().expect("stderr not open");
+        let stderr_handle = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            let mut tx = Some(tx);
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.contains("Ready to start benchmark") {
+                    tx.take()
+                        .expect("Should only send signal once")
+                        .send(())
+                        .expect("failed to send ready signal to main thread");
+                } else {
+                    println!("benchmark{{pid={pid}}} {line}");
+                }
+            }
+        });
+        Ok((child, stdout_handle, stderr_handle))
+    }
+
+    async fn open_chain_internal(
         &self,
         from: ChainId,
-        to_public_key: Option<PublicKey>,
+        owner: Option<AccountOwner>,
         initial_balance: Amount,
-    ) -> Result<(MessageId, ChainId)> {
+        super_owner: bool,
+    ) -> Result<(ChainId, AccountOwner)> {
         let mut command = self.command().await?;
         command
             .arg("open-chain")
             .args(["--from", &from.to_string()])
             .args(["--initial-balance", &initial_balance.to_string()]);
 
-        if let Some(public_key) = to_public_key {
-            command.args(["--to-public-key", &public_key.to_string()]);
+        if let Some(owner) = owner {
+            command.args(["--owner", &owner.to_string()]);
+        }
+
+        if super_owner {
+            command.arg("--super-owner");
         }
 
         let stdout = command.spawn_and_wait_for_stdout().await?;
         let mut split = stdout.split('\n');
-        let message_id: MessageId = split.next().context("no message ID in output")?.parse()?;
         let chain_id = ChainId::from_str(split.next().context("no chain ID in output")?)?;
+        let new_owner = AccountOwner::from_str(split.next().context("no owner in output")?)?;
+        if let Some(owner) = owner {
+            assert_eq!(owner, new_owner);
+        }
+        Ok((chain_id, new_owner))
+    }
 
-        Ok((message_id, chain_id))
+    /// Runs `linera open-chain --super-owner`.
+    pub async fn open_chain_super_owner(
+        &self,
+        from: ChainId,
+        owner: Option<AccountOwner>,
+        initial_balance: Amount,
+    ) -> Result<(ChainId, AccountOwner)> {
+        self.open_chain_internal(from, owner, initial_balance, true)
+            .await
+    }
+
+    /// Runs `linera open-chain`.
+    pub async fn open_chain(
+        &self,
+        from: ChainId,
+        owner: Option<AccountOwner>,
+        initial_balance: Amount,
+    ) -> Result<(ChainId, AccountOwner)> {
+        self.open_chain_internal(from, owner, initial_balance, false)
+            .await
     }
 
     /// Runs `linera open-chain` then `linera assign`.
@@ -715,29 +876,29 @@ impl ClientWrapper {
             .load_wallet()?
             .default_chain()
             .context("no default chain found")?;
-        let key = client.keygen().await?;
-        let (message_id, new_chain) = self
-            .open_chain(our_chain, Some(key), initial_balance)
+        let owner = client.keygen().await?;
+        let (new_chain, _) = self
+            .open_chain(our_chain, Some(owner), initial_balance)
             .await?;
-        assert_eq!(new_chain, client.assign(key, message_id).await?);
+        client.assign(owner, new_chain).await?;
         Ok(new_chain)
     }
 
     pub async fn open_multi_owner_chain(
         &self,
         from: ChainId,
-        to_public_keys: Vec<PublicKey>,
+        owners: Vec<AccountOwner>,
         weights: Vec<u64>,
         multi_leader_rounds: u32,
         balance: Amount,
         base_timeout_ms: u64,
-    ) -> Result<(MessageId, ChainId)> {
+    ) -> Result<ChainId> {
         let mut command = self.command().await?;
         command
             .arg("open-multi-owner-chain")
             .args(["--from", &from.to_string()])
-            .arg("--owner-public-keys")
-            .args(to_public_keys.iter().map(PublicKey::to_string))
+            .arg("--owners")
+            .args(owners.iter().map(AccountOwner::to_string))
             .args(["--base-timeout-ms", &base_timeout_ms.to_string()]);
         if !weights.is_empty() {
             command
@@ -750,31 +911,43 @@ impl ClientWrapper {
 
         let stdout = command.spawn_and_wait_for_stdout().await?;
         let mut split = stdout.split('\n');
-        let message_id: MessageId = split.next().context("no message ID in output")?.parse()?;
         let chain_id = ChainId::from_str(split.next().context("no chain ID in output")?)?;
 
-        Ok((message_id, chain_id))
+        Ok(chain_id)
     }
 
     pub async fn change_ownership(
         &self,
         chain_id: ChainId,
-        super_owner_public_keys: Vec<PublicKey>,
-        owner_public_keys: Vec<PublicKey>,
+        super_owners: Vec<AccountOwner>,
+        owners: Vec<AccountOwner>,
     ) -> Result<()> {
         let mut command = self.command().await?;
         command
             .arg("change-ownership")
             .args(["--chain-id", &chain_id.to_string()]);
-        if !super_owner_public_keys.is_empty() {
+        if !super_owners.is_empty() {
             command
-                .arg("--super-owner-public-keys")
-                .args(super_owner_public_keys.iter().map(PublicKey::to_string));
+                .arg("--super-owners")
+                .args(super_owners.iter().map(AccountOwner::to_string));
         }
-        if !owner_public_keys.is_empty() {
+        if !owners.is_empty() {
             command
-                .arg("--owner-public-keys")
-                .args(owner_public_keys.iter().map(PublicKey::to_string));
+                .arg("--owners")
+                .args(owners.iter().map(AccountOwner::to_string));
+        }
+        command.spawn_and_wait_for_stdout().await?;
+        Ok(())
+    }
+
+    /// Runs `linera wallet follow-chain CHAIN_ID`.
+    pub async fn follow_chain(&self, chain_id: ChainId, sync: bool) -> Result<()> {
+        let mut command = self.command().await?;
+        command
+            .args(["wallet", "follow-chain"])
+            .arg(chain_id.to_string());
+        if sync {
+            command.arg("--sync");
         }
         command.spawn_and_wait_for_stdout().await?;
         Ok(())
@@ -785,6 +958,16 @@ impl ClientWrapper {
         let mut command = self.command().await?;
         command
             .args(["wallet", "forget-chain"])
+            .arg(chain_id.to_string());
+        command.spawn_and_wait_for_stdout().await?;
+        Ok(())
+    }
+
+    /// Runs `linera wallet set-default CHAIN_ID`.
+    pub async fn set_default_chain(&self, chain_id: ChainId) -> Result<()> {
+        let mut command = self.command().await?;
+        command
+            .args(["wallet", "set-default"])
             .arg(chain_id.to_string());
         command.spawn_and_wait_for_stdout().await?;
         Ok(())
@@ -836,36 +1019,52 @@ impl ClientWrapper {
     }
 
     pub fn load_wallet(&self) -> Result<Wallet> {
-        util::read_json(self.wallet_path())
+        Ok(Wallet::read(&self.wallet_path())?)
+    }
+
+    pub fn load_keystore(&self) -> Result<InMemorySigner> {
+        util::read_json(self.keystore_path())
     }
 
     pub fn wallet_path(&self) -> PathBuf {
         self.path_provider.path().join(&self.wallet)
     }
 
+    pub fn keystore_path(&self) -> PathBuf {
+        self.path_provider.path().join(&self.keystore)
+    }
+
     pub fn storage_path(&self) -> &str {
         &self.storage
     }
 
-    pub fn get_owner(&self) -> Option<Owner> {
+    pub fn get_owner(&self) -> Option<AccountOwner> {
         let wallet = self.load_wallet().ok()?;
-        let chain_id = wallet.default_chain()?;
-        let public_key = wallet.get(chain_id)?.key_pair.as_ref()?.public();
-        Some(public_key.into())
+        wallet
+            .get(wallet.default_chain()?)
+            .expect("default chain must be in wallet")
+            .owner
     }
 
-    pub async fn is_chain_present_in_wallet(&self, chain: ChainId) -> bool {
+    pub fn is_chain_present_in_wallet(&self, chain: ChainId) -> bool {
         self.load_wallet()
             .ok()
             .is_some_and(|wallet| wallet.get(chain).is_some())
     }
 
-    pub async fn set_validator(&self, name: &str, port: usize, votes: usize) -> Result<()> {
+    pub async fn set_validator(
+        &self,
+        validator_key: &(String, String),
+        port: usize,
+        votes: usize,
+    ) -> Result<()> {
         let address = format!("{}:127.0.0.1:{}", self.network.short(), port);
         self.command()
             .await?
-            .arg("set-validator")
-            .args(["--name", name])
+            .arg("validator")
+            .arg("add")
+            .args(["--public-key", &validator_key.0])
+            .args(["--account-key", &validator_key.1])
             .args(["--address", &address])
             .args(["--votes", &votes.to_string()])
             .spawn_and_wait_for_stdout()
@@ -873,34 +1072,102 @@ impl ClientWrapper {
         Ok(())
     }
 
-    pub async fn remove_validator(&self, name: &str) -> Result<()> {
+    pub async fn remove_validator(&self, validator_key: &str) -> Result<()> {
         self.command()
             .await?
-            .arg("remove-validator")
-            .args(["--name", name])
+            .arg("validator")
+            .arg("remove")
+            .args(["--public-key", validator_key])
             .spawn_and_wait_for_stdout()
             .await?;
         Ok(())
     }
 
-    pub async fn finalize_committee(&self) -> Result<()> {
+    pub async fn change_validators(
+        &self,
+        add_validators: &[(String, String, usize, usize)], // (public_key, account_key, port, votes)
+        modify_validators: &[(String, String, usize, usize)], // (public_key, account_key, port, votes)
+        remove_validators: &[String],
+    ) -> Result<()> {
+        use std::str::FromStr;
+
+        use linera_base::crypto::{AccountPublicKey, ValidatorPublicKey};
+
+        // Build a map that will be serialized to JSON
+        // Use the exact types that deserialization expects
+        let mut changes = std::collections::HashMap::new();
+
+        // Add/modify validators
+        for (public_key_str, account_key_str, port, votes) in
+            add_validators.iter().chain(modify_validators.iter())
+        {
+            let public_key = ValidatorPublicKey::from_str(public_key_str)
+                .with_context(|| format!("Invalid validator public key: {}", public_key_str))?;
+
+            let account_key = AccountPublicKey::from_str(account_key_str)
+                .with_context(|| format!("Invalid account public key: {}", account_key_str))?;
+
+            let address = format!("{}:127.0.0.1:{}", self.network.short(), port)
+                .parse()
+                .unwrap();
+
+            // Create ValidatorChange struct
+            let change = crate::cli::validator::Change {
+                account_key,
+                address,
+                votes: crate::cli::validator::Votes(
+                    std::num::NonZero::new(*votes as u64).context("Votes must be non-zero")?,
+                ),
+            };
+
+            changes.insert(public_key, Some(change));
+        }
+
+        // Remove validators (set to None)
+        for validator_key_str in remove_validators {
+            let public_key = ValidatorPublicKey::from_str(validator_key_str)
+                .with_context(|| format!("Invalid validator public key: {}", validator_key_str))?;
+            changes.insert(public_key, None);
+        }
+
+        // Create temporary file with JSON
+        let temp_file = tempfile::NamedTempFile::new()
+            .context("Failed to create temporary file for validator changes")?;
+        serde_json::to_writer(&temp_file, &changes)
+            .context("Failed to write validator changes to file")?;
+        let temp_path = temp_file.path();
+
         self.command()
             .await?
-            .arg("finalize-committee")
+            .arg("validator")
+            .arg("update")
+            .arg(temp_path)
+            .arg("--yes") // Skip confirmation prompt
+            .spawn_and_wait_for_stdout()
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn revoke_epochs(&self, epoch: Epoch) -> Result<()> {
+        self.command()
+            .await?
+            .arg("revoke-epochs")
+            .arg(epoch.to_string())
             .spawn_and_wait_for_stdout()
             .await?;
         Ok(())
     }
 
     /// Runs `linera keygen`.
-    pub async fn keygen(&self) -> Result<PublicKey> {
+    pub async fn keygen(&self) -> Result<AccountOwner> {
         let stdout = self
             .command()
             .await?
             .arg("keygen")
             .spawn_and_wait_for_stdout()
             .await?;
-        Ok(PublicKey::from_str(stdout.trim())?)
+        AccountOwner::from_str(stdout.as_str().trim())
     }
 
     /// Returns the default chain.
@@ -909,19 +1176,36 @@ impl ClientWrapper {
     }
 
     /// Runs `linera assign`.
-    pub async fn assign(&self, key: PublicKey, message_id: MessageId) -> Result<ChainId> {
-        let stdout = self
+    pub async fn assign(&self, owner: AccountOwner, chain_id: ChainId) -> Result<()> {
+        let _stdout = self
             .command()
             .await?
             .arg("assign")
-            .args(["--key", &key.to_string()])
-            .args(["--message-id", &message_id.to_string()])
+            .args(["--owner", &owner.to_string()])
+            .args(["--chain-id", &chain_id.to_string()])
             .spawn_and_wait_for_stdout()
             .await?;
+        Ok(())
+    }
 
-        let chain_id = ChainId::from_str(stdout.trim())?;
-
-        Ok(chain_id)
+    /// Runs `linera set-preferred-owner` for `chain_id`.
+    pub async fn set_preferred_owner(
+        &self,
+        chain_id: ChainId,
+        owner: Option<AccountOwner>,
+    ) -> Result<()> {
+        let mut owner_arg = vec!["--owner".to_string()];
+        if let Some(owner) = owner {
+            owner_arg.push(owner.to_string());
+        };
+        self.command()
+            .await?
+            .arg("set-preferred-owner")
+            .args(["--chain-id", &chain_id.to_string()])
+            .args(owner_arg)
+            .spawn_and_wait_for_stdout()
+            .await?;
+        Ok(())
     }
 
     pub async fn build_application(
@@ -950,7 +1234,7 @@ impl ClientWrapper {
 
         let contract_size = fs_err::tokio::metadata(&contract).await?.len();
         let service_size = fs_err::tokio::metadata(&service).await?.len();
-        info!("Done building application {name}: contract_size={contract_size}, service_size={service_size}");
+        tracing::info!("Done building application {name}: contract_size={contract_size}, service_size={service_size}");
 
         Ok((contract, service))
     }
@@ -965,12 +1249,14 @@ impl Drop for ClientWrapper {
         }
 
         let Ok(binary_path) = self.binary_path.lock() else {
-            error!("Failed to close chains because a thread panicked with a lock to `binary_path`");
+            tracing::error!(
+                "Failed to close chains because a thread panicked with a lock to `binary_path`"
+            );
             return;
         };
 
         let Some(binary_path) = binary_path.as_ref() else {
-            warn!(
+            tracing::warn!(
                 "Assuming no chains need to be closed, because the command binary was never \
                 resolved and therefore presumably never called"
             );
@@ -989,17 +1275,17 @@ impl Drop for ClientWrapper {
             .args(["wallet", "show", "--short", "--owned"])
             .output()
         else {
-            warn!("Failed to execute `wallet show --short` to list chains to close");
+            tracing::warn!("Failed to execute `wallet show --short` to list chains to close");
             return;
         };
 
         if !wallet_show_output.status.success() {
-            warn!("Failed to list chains in the wallet to close them");
+            tracing::warn!("Failed to list chains in the wallet to close them");
             return;
         }
 
         let Ok(chain_list_string) = String::from_utf8(wallet_show_output.stdout) else {
-            warn!(
+            tracing::warn!(
                 "Failed to close chains because `linera wallet show --short` \
                 returned a non-UTF-8 output"
             );
@@ -1022,19 +1308,11 @@ impl Drop for ClientWrapper {
 
             match close_chain_command.args(["close-chain", chain_id]).status() {
                 Ok(status) if status.success() => (),
-                Ok(failure) => warn!("Failed to close chain {chain_id}: {failure}"),
-                Err(error) => warn!("Failed to close chain {chain_id}: {error}"),
+                Ok(failure) => tracing::warn!("Failed to close chain {chain_id}: {failure}"),
+                Err(error) => tracing::warn!("Failed to close chain {chain_id}: {error}"),
             }
         }
     }
-}
-
-/// Whether `wallet_init` should use a faucet.
-#[derive(Clone, Copy, Debug)]
-pub enum FaucetOption<'a> {
-    None,
-    GenesisOnly(&'a Faucet),
-    NewChain(&'a Faucet),
 }
 
 #[cfg(with_testing)]
@@ -1050,11 +1328,21 @@ impl ClientWrapper {
 }
 
 fn truncate_query_output(input: &str) -> String {
-    let max_len = 200;
+    let max_len = 1000;
     if input.len() < max_len {
         input.to_string()
     } else {
         format!("{} ...", input.get(..max_len).unwrap())
+    }
+}
+
+fn truncate_query_output_serialize<T: Serialize>(query: T) -> String {
+    let query = serde_json::to_string(&query).expect("Failed to serialize the failed query");
+    let max_len = 200;
+    if query.len() < max_len {
+        query
+    } else {
+        format!("{} ...", query.get(..max_len).unwrap())
     }
 }
 
@@ -1087,41 +1375,76 @@ impl NodeService {
         Ok(serde_json::from_value(data["processInbox"].take())?)
     }
 
-    pub async fn make_application<A: ContractAbi>(
+    pub async fn sync(&self, chain_id: &ChainId) -> Result<u64> {
+        let query = format!("mutation {{ sync(chainId: \"{chain_id}\") }}");
+        let mut data = self.query_node(query).await?;
+        Ok(serde_json::from_value(data["sync"].take())?)
+    }
+
+    pub async fn transfer(
+        &self,
+        chain_id: ChainId,
+        owner: AccountOwner,
+        recipient: Account,
+        amount: Amount,
+    ) -> Result<CryptoHash> {
+        let json_owner = owner.to_value();
+        let json_recipient = recipient.to_value();
+        let query = format!(
+            "mutation {{ transfer(\
+                 chainId: \"{chain_id}\", \
+                 owner: {json_owner}, \
+                 recipient: {json_recipient}, \
+                 amount: \"{amount}\") \
+             }}"
+        );
+        let data = self.query_node(query).await?;
+        serde_json::from_value(data["transfer"].clone())
+            .context("missing transfer field in response")
+    }
+
+    pub async fn balance(&self, account: &Account) -> Result<Amount> {
+        let chain = account.chain_id;
+        let owner = account.owner;
+        if matches!(owner, AccountOwner::CHAIN) {
+            let query = format!(
+                "query {{ chain(chainId:\"{chain}\") {{
+                    executionState {{ system {{ balance }} }}
+                }} }}"
+            );
+            let response = self.query_node(query).await?;
+            let balance = &response["chain"]["executionState"]["system"]["balance"]
+                .as_str()
+                .unwrap();
+            return Ok(Amount::from_str(balance)?);
+        }
+        let query = format!(
+            "query {{ chain(chainId:\"{chain}\") {{
+                executionState {{ system {{ balances {{
+                    entry(key:\"{owner}\") {{ value }}
+                }} }} }}
+            }} }}"
+        );
+        let response = self.query_node(query).await?;
+        let balances = &response["chain"]["executionState"]["system"]["balances"];
+        let balance = balances["entry"]["value"].as_str();
+        match balance {
+            None => Ok(Amount::ZERO),
+            Some(amount) => Ok(Amount::from_str(amount)?),
+        }
+    }
+
+    pub fn make_application<A: ContractAbi>(
         &self,
         chain_id: &ChainId,
         application_id: &ApplicationId<A>,
     ) -> Result<ApplicationWrapper<A>> {
         let application_id = application_id.forget_abi().to_string();
-        let values = self.try_get_applications_uri(chain_id).await?;
-        let Some(link) = values.get(&application_id) else {
-            bail!("Could not find application URI: {application_id}");
-        };
-        Ok(ApplicationWrapper::from(link.to_string()))
-    }
-
-    pub async fn try_get_applications_uri(
-        &self,
-        chain_id: &ChainId,
-    ) -> Result<HashMap<String, String>> {
-        let query = format!("query {{ applications(chainId: \"{chain_id}\") {{ id link }}}}");
-        let data = self.query_node(query).await?;
-        data["applications"]
-            .as_array()
-            .context("missing applications in response")?
-            .iter()
-            .map(|a| {
-                let id = a["id"]
-                    .as_str()
-                    .context("missing id field in response")?
-                    .to_string();
-                let link = a["link"]
-                    .as_str()
-                    .context("missing link field in response")?
-                    .to_string();
-                Ok((id, link))
-            })
-            .collect()
+        let link = format!(
+            "http://localhost:{}/chains/{chain_id}/applications/{application_id}",
+            self.port
+        );
+        Ok(ApplicationWrapper::from(link))
     }
 
     pub async fn publish_data_blob(
@@ -1139,28 +1462,57 @@ impl NodeService {
             .context("missing publishDataBlob field in response")
     }
 
-    pub async fn publish_bytecode<Abi, Parameters, InstantiationArgument>(
+    pub async fn publish_module<Abi, Parameters, InstantiationArgument>(
         &self,
         chain_id: &ChainId,
         contract: PathBuf,
         service: PathBuf,
-    ) -> Result<BytecodeId<Abi, Parameters, InstantiationArgument>> {
-        let contract_code = Bytecode::load_from_file(&contract).await?;
-        let service_code = Bytecode::load_from_file(&service).await?;
+        vm_runtime: VmRuntime,
+    ) -> Result<ModuleId<Abi, Parameters, InstantiationArgument>> {
+        let contract_code = Bytecode::load_from_file(&contract)?;
+        let service_code = Bytecode::load_from_file(&service)?;
         let query = format!(
-            "mutation {{ publishBytecode(chainId: {}, contract: {}, service: {}) }}",
+            "mutation {{ publishModule(chainId: {}, contract: {}, service: {}, vmRuntime: {}) }}",
             chain_id.to_value(),
             contract_code.to_value(),
             service_code.to_value(),
+            vm_runtime.to_value(),
         );
         let data = self.query_node(query).await?;
-        let bytecode_str = data["publishBytecode"]
+        let module_str = data["publishModule"]
             .as_str()
-            .context("bytecode ID not found")?;
-        let bytecode_id: BytecodeId = bytecode_str
-            .parse()
-            .context("could not parse bytecode ID")?;
-        Ok(bytecode_id.with_abi())
+            .context("module ID not found")?;
+        let module_id: ModuleId = module_str.parse().context("could not parse module ID")?;
+        Ok(module_id.with_abi())
+    }
+
+    pub async fn query_committees(&self, chain_id: &ChainId) -> Result<BTreeMap<Epoch, Committee>> {
+        let query = format!(
+            "query {{ chain(chainId:\"{chain_id}\") {{
+                executionState {{ system {{ committees }} }}
+            }} }}"
+        );
+        let mut response = self.query_node(query).await?;
+        let committees = response["chain"]["executionState"]["system"]["committees"].take();
+        Ok(serde_json::from_value(committees)?)
+    }
+
+    pub async fn events_from_index(
+        &self,
+        chain_id: &ChainId,
+        stream_id: &StreamId,
+        start_index: u32,
+    ) -> Result<Vec<IndexAndEvent>> {
+        let query = format!(
+            "query {{
+               eventsFromIndex(chainId: \"{chain_id}\", streamId: {}, startIndex: {start_index})
+               {{ index event }}
+             }}",
+            stream_id.to_value()
+        );
+        let mut response = self.query_node(query).await?;
+        let response = response["eventsFromIndex"].take();
+        Ok(serde_json::from_value(response)?)
     }
 
     pub async fn query_node(&self, query: impl AsRef<str>) -> Result<Value> {
@@ -1176,7 +1528,10 @@ impl NodeService {
                 .send()
                 .await;
             if matches!(result, Err(ref error) if error.is_timeout()) {
-                warn!("Timeout when sending query {query:?} to the node service");
+                tracing::warn!(
+                    "Timeout when sending query {} to the node service",
+                    truncate_query_output(query)
+                );
                 continue;
             }
             let response = result.with_context(|| {
@@ -1185,7 +1540,7 @@ impl NodeService {
                     truncate_query_output(query)
                 )
             })?;
-            anyhow::ensure!(
+            ensure!(
                 response.status().is_success(),
                 "Query \"{}\" failed: {}",
                 truncate_query_output(query),
@@ -1196,7 +1551,7 @@ impl NodeService {
             );
             let value: Value = response.json().await.context("invalid JSON")?;
             if let Some(errors) = value.get("errors") {
-                warn!(
+                tracing::warn!(
                     "Query \"{}\" failed: {}",
                     truncate_query_output(query),
                     errors
@@ -1219,12 +1574,12 @@ impl NodeService {
     >(
         &self,
         chain_id: &ChainId,
-        bytecode_id: &BytecodeId<Abi, Parameters, InstantiationArgument>,
+        module_id: &ModuleId<Abi, Parameters, InstantiationArgument>,
         parameters: &Parameters,
         argument: &InstantiationArgument,
         required_application_ids: &[ApplicationId],
     ) -> Result<ApplicationId<Abi>> {
-        let bytecode_id = bytecode_id.forget_abi();
+        let module_id = module_id.forget_abi();
         let json_required_applications_ids = required_application_ids
             .iter()
             .map(ApplicationId::to_string)
@@ -1240,7 +1595,7 @@ impl NodeService {
         let query = format!(
             "mutation {{ createApplication(\
                  chainId: \"{chain_id}\",
-                 bytecodeId: \"{bytecode_id}\", \
+                 moduleId: \"{module_id}\", \
                  parameters: {new_parameters}, \
                  instantiationArgument: {new_argument}, \
                  requiredApplicationIds: {json_required_applications_ids}) \
@@ -1257,53 +1612,27 @@ impl NodeService {
             .with_abi())
     }
 
-    pub async fn request_application<A: ContractAbi>(
-        &self,
-        chain_id: &ChainId,
-        application_id: &ApplicationId<A>,
-    ) -> Result<String> {
-        let application_id = application_id.forget_abi();
+    /// Obtains the hash and height of the `chain`'s tip block, as known by this node service.
+    pub async fn chain_tip(&self, chain: ChainId) -> Result<Option<(CryptoHash, BlockHeight)>> {
         let query = format!(
-            "mutation {{ requestApplication(\
-                 chainId: \"{chain_id}\", \
-                 applicationId: \"{application_id}\") \
-             }}"
+            r#"query {{ block(chainId: "{chain}") {{
+                hash
+                block {{ header {{ height }} }}
+            }} }}"#
         );
-        let data = self.query_node(query).await?;
-        serde_json::from_value(data["requestApplication"].clone())
-            .context("missing requestApplication field in response")
-    }
-
-    pub async fn subscribe(
-        &self,
-        subscriber_chain_id: ChainId,
-        publisher_chain_id: ChainId,
-        channel: SystemChannel,
-    ) -> Result<()> {
-        let query = format!(
-            "mutation {{ subscribe(\
-                 subscriberChainId: \"{subscriber_chain_id}\", \
-                 publisherChainId: \"{publisher_chain_id}\", \
-                 channel: \"{}\") \
-             }}",
-            channel.to_value(),
-        );
-        self.query_node(query).await?;
-        Ok(())
-    }
-
-    /// Obtains the hash of the `chain`'s tip block, as known by this node service.
-    pub async fn chain_tip_hash(&self, chain: ChainId) -> Result<Option<CryptoHash>> {
-        let query = format!(r#"query {{ block(chainId: "{chain}") {{ hash }} }}"#);
 
         let mut response = self.query_node(&query).await?;
 
-        match mem::take(&mut response["block"]["hash"]) {
-            Value::Null => Ok(None),
-            Value::String(hash) => Ok(Some(
+        match (
+            mem::take(&mut response["block"]["hash"]),
+            mem::take(&mut response["block"]["block"]["header"]["height"]),
+        ) {
+            (Value::Null, Value::Null) => Ok(None),
+            (Value::String(hash), Value::Number(height)) => Ok(Some((
                 hash.parse()
                     .context("Received an invalid hash {hash:?} for chain tip")?,
-            )),
+                BlockHeight(height.as_u64().unwrap()),
+            ))),
             invalid_data => bail!("Expected a tip hash string, but got {invalid_data:?} instead"),
         }
     }
@@ -1312,7 +1641,7 @@ impl NodeService {
     pub async fn notifications(
         &self,
         chain_id: ChainId,
-    ) -> Result<impl Stream<Item = Result<Notification>>> {
+    ) -> Result<Pin<Box<impl Stream<Item = Result<Notification>>>>> {
         let query = format!("subscription {{ notifications(chainId: \"{chain_id}\") }}",);
         let url = format!("ws://localhost:{}/ws", self.port);
         let mut request = url.into_client_request()?;
@@ -1345,9 +1674,8 @@ impl NodeService {
           }
         });
         websocket.send(query_json.to_string().into()).await?;
-        Ok(websocket
-            .map_err(anyhow::Error::from)
-            .and_then(|message| async {
+        Ok(Box::pin(websocket.map_err(anyhow::Error::from).and_then(
+            |message| async {
                 let text = message.into_text()?;
                 let value: Value = serde_json::from_str(&text).context("invalid JSON")?;
                 if let Some(errors) = value["payload"].get("errors") {
@@ -1355,7 +1683,8 @@ impl NodeService {
                 }
                 serde_json::from_value(value["payload"]["data"]["notifications"].clone())
                     .context("Failed to deserialize notification")
-            }))
+            },
+        )))
     }
 }
 
@@ -1363,11 +1692,16 @@ impl NodeService {
 pub struct FaucetService {
     port: u16,
     child: Child,
+    _temp_dir: tempfile::TempDir,
 }
 
 impl FaucetService {
-    fn new(port: u16, child: Child) -> Self {
-        Self { port, child }
+    fn new(port: u16, child: Child, temp_dir: tempfile::TempDir) -> Self {
+        Self {
+            port,
+            child,
+            _temp_dir: temp_dir,
+        }
     }
 
     pub async fn terminate(mut self) -> Result<()> {
@@ -1386,188 +1720,6 @@ impl FaucetService {
     }
 }
 
-/// A faucet instance that can be queried.
-#[derive(Debug, Clone)]
-pub struct Faucet {
-    url: String,
-}
-
-impl Faucet {
-    pub fn new(url: String) -> Self {
-        Self { url }
-    }
-
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
-    pub async fn genesis_config(&self) -> Result<GenesisConfig> {
-        let query = "query { genesisConfig }";
-        let client = reqwest_client();
-        let response = client
-            .post(&self.url)
-            .json(&json!({ "query": query }))
-            .send()
-            .await
-            .context("genesis_config: failed to post query")?;
-        anyhow::ensure!(
-            response.status().is_success(),
-            "Query \"{}\" failed: {}",
-            query,
-            response
-                .text()
-                .await
-                .unwrap_or_else(|error| format!("Could not get response text: {error}"))
-        );
-        let mut value: Value = response.json().await.context("invalid JSON")?;
-        if let Some(errors) = value.get("errors") {
-            bail!("Query \"{}\" failed: {}", query, errors);
-        }
-        serde_json::from_value(value["data"]["genesisConfig"].take())
-            .context("could not parse genesis config")
-    }
-
-    pub async fn version_info(&self) -> Result<VersionInfo> {
-        let query =
-            "query { version { crateVersion gitCommit gitDirty rpcHash graphqlHash witHash } }";
-        let client = reqwest_client();
-        let response = client
-            .post(&self.url)
-            .json(&json!({ "query": query }))
-            .send()
-            .await
-            .context("version_info: failed to post query")?;
-        anyhow::ensure!(
-            response.status().is_success(),
-            "Query \"{}\" failed: {}",
-            query,
-            response
-                .text()
-                .await
-                .unwrap_or_else(|error| format!("Could not get response text: {error}"))
-        );
-        let mut value: Value = response.json().await.context("invalid JSON")?;
-        if let Some(errors) = value.get("errors") {
-            bail!("Query \"{}\" failed: {}", query, errors);
-        }
-        let crate_version = serde_json::from_value(value["data"]["version"]["crateVersion"].take())
-            .context("could not parse crate version")?;
-        let git_commit = serde_json::from_value(value["data"]["version"]["gitCommit"].take())
-            .context("could not parse git commit")?;
-        let git_dirty = serde_json::from_value(value["data"]["version"]["gitDirty"].take())
-            .context("could not parse git dirty")?;
-        let rpc_hash = serde_json::from_value(value["data"]["version"]["rpcHash"].take())
-            .context("could not parse rpc hash")?;
-        let graphql_hash = serde_json::from_value(value["data"]["version"]["graphqlHash"].take())
-            .context("could not parse graphql hash")?;
-        let wit_hash = serde_json::from_value(value["data"]["version"]["witHash"].take())
-            .context("could not parse wit hash")?;
-        Ok(VersionInfo {
-            crate_version,
-            git_commit,
-            git_dirty,
-            rpc_hash,
-            graphql_hash,
-            wit_hash,
-        })
-    }
-
-    pub async fn claim(&self, public_key: &PublicKey) -> Result<ClaimOutcome> {
-        let query = format!(
-            "mutation {{ claim(publicKey: \"{public_key}\") {{ \
-                messageId chainId certificateHash \
-            }} }}"
-        );
-        let client = reqwest_client();
-        let response = client
-            .post(&self.url)
-            .json(&json!({ "query": &query }))
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "claim: failed to post query={}",
-                    truncate_query_output(&query)
-                )
-            })?;
-        anyhow::ensure!(
-            response.status().is_success(),
-            "Query \"{}\" failed: {}",
-            query,
-            response
-                .text()
-                .await
-                .unwrap_or_else(|error| format!("Could not get response text: {error}"))
-        );
-        let value: Value = response.json().await.context("invalid JSON")?;
-        if let Some(errors) = value.get("errors") {
-            bail!("Query \"{}\" failed: {}", query, errors);
-        }
-        let data = &value["data"]["claim"];
-        let message_id = data["messageId"]
-            .as_str()
-            .context("message ID not found")?
-            .parse()
-            .context("could not parse message ID")?;
-        let chain_id = data["chainId"]
-            .as_str()
-            .context("chain ID not found")?
-            .parse()
-            .context("could not parse chain ID")?;
-        let certificate_hash = data["certificateHash"]
-            .as_str()
-            .context("Certificate hash not found")?
-            .parse()
-            .context("could not parse certificate hash")?;
-        let outcome = ClaimOutcome {
-            message_id,
-            chain_id,
-            certificate_hash,
-        };
-        Ok(outcome)
-    }
-
-    pub async fn current_validators(&self) -> Result<Vec<(ValidatorName, String)>> {
-        let query = "query { currentValidators { name networkAddress } }";
-        let client = reqwest_client();
-        let response = client
-            .post(&self.url)
-            .json(&json!({ "query": query }))
-            .send()
-            .await
-            .context("current_validators: failed to post query")?;
-        anyhow::ensure!(
-            response.status().is_success(),
-            "Query \"{}\" failed: {}",
-            query,
-            response
-                .text()
-                .await
-                .unwrap_or_else(|error| format!("Could not get response text: {error}"))
-        );
-        let mut value: Value = response.json().await.context("invalid JSON")?;
-        if let Some(errors) = value.get("errors") {
-            bail!("Query \"{}\" failed: {}", query, errors);
-        }
-        let validators = match value["data"]["currentValidators"].take() {
-            serde_json::Value::Array(validators) => validators,
-            validators => bail!("{validators} is not an array"),
-        };
-        validators
-            .into_iter()
-            .map(|mut validator| {
-                let name = serde_json::from_value::<ValidatorName>(validator["name"].take())
-                    .context("could not parse current validators: invalid name")?;
-                let addr = validator["networkAddress"]
-                    .as_str()
-                    .context("could not parse current validators: invalid address")?
-                    .to_string();
-                Ok((name, addr))
-            })
-            .collect()
-    }
-}
-
 /// A running `Application` to be queried in GraphQL.
 pub struct ApplicationWrapper<A> {
     uri: String,
@@ -1575,39 +1727,37 @@ pub struct ApplicationWrapper<A> {
 }
 
 impl<A> ApplicationWrapper<A> {
-    pub async fn raw_query(&self, query: impl AsRef<str>) -> Result<Value> {
+    pub async fn run_graphql_query(&self, query: impl AsRef<str>) -> Result<Value> {
+        let query = query.as_ref();
+        let value = self.run_json_query(json!({ "query": query })).await?;
+        Ok(value["data"].clone())
+    }
+
+    pub async fn run_json_query<T: Serialize>(&self, query: T) -> Result<Value> {
         const MAX_RETRIES: usize = 5;
 
         for i in 0.. {
-            let query = query.as_ref();
             let client = reqwest_client();
-            let result = client
-                .post(&self.uri)
-                .json(&json!({ "query": query }))
-                .send()
-                .await;
+            let result = client.post(&self.uri).json(&query).send().await;
             let response = match result {
                 Ok(response) => response,
                 Err(error) if i < MAX_RETRIES => {
-                    warn!(
+                    tracing::warn!(
                         "Failed to post query \"{}\": {error}; retrying",
-                        truncate_query_output(query),
+                        truncate_query_output_serialize(&query),
                     );
                     continue;
                 }
                 Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "raw_query: failed to post query={}",
-                            truncate_query_output(query)
-                        )
-                    });
+                    let query = truncate_query_output_serialize(&query);
+                    return Err(error)
+                        .with_context(|| format!("run_json_query: failed to post query={query}"));
                 }
             };
-            anyhow::ensure!(
+            ensure!(
                 response.status().is_success(),
                 "Query \"{}\" failed: {}",
-                truncate_query_output(query),
+                truncate_query_output_serialize(&query),
                 response
                     .text()
                     .await
@@ -1617,18 +1767,19 @@ impl<A> ApplicationWrapper<A> {
             if let Some(errors) = value.get("errors") {
                 bail!(
                     "Query \"{}\" failed: {}",
-                    truncate_query_output(query),
+                    truncate_query_output_serialize(&query),
                     errors
                 );
             }
-            return Ok(value["data"].clone());
+            return Ok(value);
         }
         unreachable!()
     }
 
     pub async fn query(&self, query: impl AsRef<str>) -> Result<Value> {
         let query = query.as_ref();
-        self.raw_query(&format!("query {{ {query} }}")).await
+        self.run_graphql_query(&format!("query {{ {query} }}"))
+            .await
     }
 
     pub async fn query_json<T: DeserializeOwned>(&self, query: impl AsRef<str>) -> Result<T> {
@@ -1643,7 +1794,17 @@ impl<A> ApplicationWrapper<A> {
 
     pub async fn mutate(&self, mutation: impl AsRef<str>) -> Result<Value> {
         let mutation = mutation.as_ref();
-        self.raw_query(&format!("mutation {{ {mutation} }}")).await
+        self.run_graphql_query(&format!("mutation {{ {mutation} }}"))
+            .await
+    }
+
+    pub async fn multiple_mutate(&self, mutations: &[String]) -> Result<Value> {
+        let mut out = String::from("mutation {\n");
+        for (index, mutation) in mutations.iter().enumerate() {
+            out = format!("{}  u{}: {}\n", out, index, mutation);
+        }
+        out.push_str("}\n");
+        self.run_graphql_query(&out).await
     }
 }
 
@@ -1652,6 +1813,106 @@ impl<A> From<String> for ApplicationWrapper<A> {
         ApplicationWrapper {
             uri,
             _phantom: PhantomData,
+        }
+    }
+}
+
+/// Returns the timeout for tests that wait for notifications, either read from the env
+/// variable `LINERA_TEST_NOTIFICATION_TIMEOUT_MS`, or the default value of 10 seconds.
+#[cfg(with_testing)]
+fn notification_timeout() -> Duration {
+    const NOTIFICATION_TIMEOUT_MS_ENV: &str = "LINERA_TEST_NOTIFICATION_TIMEOUT_MS";
+    const NOTIFICATION_TIMEOUT_MS_DEFAULT: u64 = 10_000;
+
+    match env::var(NOTIFICATION_TIMEOUT_MS_ENV) {
+        Ok(var) => Duration::from_millis(var.parse().unwrap_or_else(|error| {
+            panic!("{NOTIFICATION_TIMEOUT_MS_ENV} is not a valid number: {error}")
+        })),
+        Err(env::VarError::NotPresent) => Duration::from_millis(NOTIFICATION_TIMEOUT_MS_DEFAULT),
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!("{NOTIFICATION_TIMEOUT_MS_ENV} must be valid Unicode")
+        }
+    }
+}
+
+#[cfg(with_testing)]
+pub trait NotificationsExt {
+    /// Waits for a notification for which `f` returns `Some(t)`, and returns `t`.
+    fn wait_for<T>(
+        &mut self,
+        f: impl FnMut(Notification) -> Option<T>,
+    ) -> impl Future<Output = Result<T>>;
+
+    /// Waits for a `NewEvents` notification for the given block height. If no height is specified,
+    /// any height is accepted.
+    fn wait_for_events(
+        &mut self,
+        expected_height: impl Into<Option<BlockHeight>>,
+    ) -> impl Future<Output = Result<BTreeSet<StreamId>>> {
+        let expected_height = expected_height.into();
+        self.wait_for(move |notification| {
+            if let Reason::NewEvents {
+                height,
+                event_streams,
+                ..
+            } = notification.reason
+            {
+                if expected_height.is_none_or(|h| h == height) {
+                    return Some(event_streams);
+                }
+            }
+            None
+        })
+    }
+
+    /// Waits for a `NewBlock` notification for the given block height. If no height is specified,
+    /// any height is accepted.
+    fn wait_for_block(
+        &mut self,
+        expected_height: impl Into<Option<BlockHeight>>,
+    ) -> impl Future<Output = Result<CryptoHash>> {
+        let expected_height = expected_height.into();
+        self.wait_for(move |notification| {
+            if let Reason::NewBlock { height, hash, .. } = notification.reason {
+                if expected_height.is_none_or(|h| h == height) {
+                    return Some(hash);
+                }
+            }
+            None
+        })
+    }
+
+    /// Waits for a `NewIncomingBundle` notification for the given sender chain and sender block
+    /// height. If no height is specified, any height is accepted.
+    fn wait_for_bundle(
+        &mut self,
+        expected_origin: ChainId,
+        expected_height: impl Into<Option<BlockHeight>>,
+    ) -> impl Future<Output = Result<()>> {
+        let expected_height = expected_height.into();
+        self.wait_for(move |notification| {
+            if let Reason::NewIncomingBundle { height, origin } = notification.reason {
+                if expected_height.is_none_or(|h| h == height) && origin == expected_origin {
+                    return Some(());
+                }
+            }
+            None
+        })
+    }
+}
+
+#[cfg(with_testing)]
+impl<S: Stream<Item = Result<Notification>>> NotificationsExt for Pin<Box<S>> {
+    async fn wait_for<T>(&mut self, mut f: impl FnMut(Notification) -> Option<T>) -> Result<T> {
+        let mut timeout = Box::pin(linera_base::time::timer::sleep(notification_timeout())).fuse();
+        loop {
+            let notification = futures::select! {
+                () = timeout => bail!("Timeout waiting for notification"),
+                notification = self.next().fuse() => notification.context("Stream closed")??,
+            };
+            if let Some(t) = f(notification) {
+                return Ok(t);
+            }
         }
     }
 }
